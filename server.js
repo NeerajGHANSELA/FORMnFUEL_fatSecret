@@ -229,12 +229,14 @@ function parseFoodDescription(desc) {
     };
 }
 
-// Common ingredient unit weight approximations (in grams) to bridge dynamic unit types to 100g search default.
+// Genuine measuring-unit weight approximations (in grams) - a tbsp/cup/oz is roughly the
+// same weight regardless of which food it's measuring, so these are trustworthy as a
+// generic conversion. Deliberately does NOT include per-food guesses (egg/banana) or
+// size adjectives (large/medium/small/whole) - those aren't real unit conversions (a
+// "large" egg and a "large" chicken breast aren't the same weight), and resolveMacros
+// now has a strictly better source for that: pickReferenceServing reads the actual
+// matched food's own real serving weight from FatSecret instead of guessing.
 const CONVERSIONS = {
-    'egg': 50,
-    'eggs': 50,
-    'banana': 120,
-    'bananas': 120,
     'slice': 30,
     'slices': 30,
     'scoop': 30,
@@ -249,11 +251,7 @@ const CONVERSIONS = {
     'teaspoons': 5,
     'oz': 28.35,
     'ounce': 28.35,
-    'ounces': 28.35,
-    'large': 120,
-    'medium': 100,
-    'small': 50,
-    'whole': 100
+    'ounces': 28.35
 };
 
 /**
@@ -386,21 +384,22 @@ function resolveMacros(servings, parsedIng) {
         // independent of which food it's measuring, so CONVERSIONS' per-unit entry is
         // trustworthy here. Size adjectives (large/medium/small/whole) don't have that
         // property - "whole" in "whole wheat roti" isn't even sizing the roti, it's
-        // describing the flour - so they fall through to the food-specific check below
+        // describing the flour - so they fall through to the real-data check below
         // instead of a blind size-word guess.
         if (ingUnit && !SIZE_ADJECTIVES.includes(ingUnit) && CONVERSIONS[ingUnit] != null) {
             return parsedIng.quantity * CONVERSIONS[ingUnit];
         }
 
         // No trustworthy unit-based conversion - FatSecret's own natural reference
-        // serving for the actual matched food (real, curated per-food data) beats a
-        // hardcoded per-food guess that only covers ~2 foods (egg/banana) and a blind
-        // 100g default for everything else, e.g. treating "3 rotis" as 300g instead of
-        // ~150g and inflating calories 2x+ (confirmed live on this exact food).
+        // serving for the actual matched food (real, curated per-food data) beats any
+        // hardcoded guess, e.g. treating "3 rotis" as 300g instead of ~150g and
+        // inflating calories 2x+ (confirmed live on this exact food).
         const reference = pickReferenceServing(servings);
         if (reference) return parsedIng.quantity * reference.grams;
 
-        return parsedIng.quantity * (CONVERSIONS[parsedIng.food] || CONVERSIONS[ingUnit] || 100);
+        // Last resort: food.get returned no servings with any usable metric data at
+        // all (rare) - nothing left to anchor on but a flat per-unit guess.
+        return parsedIng.quantity * 100;
     })();
     // The AI's own per-ingredient gram estimate is a much better plausibility anchor than
     // the fallback chain above when it's actually present - it's specific to this exact
@@ -802,12 +801,13 @@ app.post('/api/nutrition/analyze', async (req, res) => {
                         // Never divide a raw quantity in one unit by a serving amount in another
                         // unit - normalize both sides to grams first. Real metric units
                         // (g/kg/oz/ml, any full/plural form) go through toGrams for an exact
-                        // conversion; only genuine count units (egg, slice, cup...) or a
-                        // missing unit fall back to the CONVERSIONS approximation table - it
-                        // has no entry for kg/ml, so those used to silently default to "1
-                        // unit = 100g" and be off by 100x+ (same bug as in resolveMacros above).
+                        // conversion; genuine measuring-unit words (slice, cup...) fall back to
+                        // the CONVERSIONS approximation table. There's no `servings` array in
+                        // this text-description-only path (unlike resolveMacros above), so
+                        // pickReferenceServing can't help here - a missing/unrecognized unit
+                        // still has nothing better than the flat 100g default.
                         const ingredientGrams = toGrams(parsedIng.quantity, ingUnit)
-                            ?? parsedIng.quantity * (CONVERSIONS[parsedIng.food] || CONVERSIONS[ingUnit] || 100);
+                            ?? parsedIng.quantity * (CONVERSIONS[ingUnit] || 100);
                         const servingGrams = toGrams(servingDetails.servingAmount, servUnit)
                             ?? servingDetails.servingAmount * (CONVERSIONS[servUnit] || 100);
                         scalingFactor = ingredientGrams / servingGrams;
