@@ -539,7 +539,8 @@ async function fetchWithRetry(url, options, { retries = 3, baseDelayMs = 500 } =
 }
 
 // One foods.search call, reduced to its useful outcome: the best matching food
-// item, or null (HTTP failure or empty result set both mean "this term found
+// item, or null (HTTP failure, empty result set, or - when foodCore is given -
+// zero candidates relevant enough to accept - all mean "this term found
 // nothing usable" to the caller, which decides whether to retry with a
 // different term).
 //
@@ -550,17 +551,143 @@ async function fetchWithRetry(url, options, { retries = 3, baseDelayMs = 500 } =
 // Mediterranean Grill" restaurant chain's branded pita bread as the #1
 // result, ahead of any real roti/chapati entry).
 //
-// IMPORTANT: "prefer whichever Generic result comes first" is not enough on
-// its own - confirmed live, for "whole wheat rotis" the first Generic result
-// was "Whole Wheat Bagel", which is Generic but simply the wrong food (shares
-// "whole wheat" with the search, not the food itself). A Generic candidate
-// only overrides the top result when its own name contains the search
-// phrase's head noun (its last word, singular or plural) - the word that
-// actually names the food, as opposed to leading modifiers like "whole
-// wheat"/"lean"/"boiled" that many unrelated foods also share. Falls back to
-// whatever ranked first when no Generic candidate passes that check - a
-// branded match beats no match at all.
-async function searchFoodItem(searchExpression, token) {
+// foodCore (optional) is the AI's own minimal, canonical name for the food's
+// identity (e.g. "fresh krachai" -> "krachai", "white fish fillet" -> "white
+// fish") - every one of its words must appear in a candidate's name
+// (singular/plural-insensitive) before that candidate can be accepted, for
+// BOTH the "prefer Generic" step and the final fallback. This replaces a
+// cruder self-derived "head word" (the search phrase's last word) as the
+// relevance gate, because "last word = most distinguishing word" isn't
+// reliable: confirmed live, foods.search("fresh krachai") returns Fresh Ham,
+// Fresh Lime Juice, Fresh Asiago Cheese etc. - none contain "krachai," they
+// only coincidentally share "fresh" - and foods.search("white fish fillet")
+// returns several branded "Fish Stick Patty or Fillet" products that all
+// contain "fillet" yet are the wrong food entirely. Only the AI that wrote
+// the ingredient string actually knows which words are the food's real
+// identity vs. just modifiers, so when foodCore is available there is no
+// blind fallback: if nothing in the top results passes the gate, this
+// returns null exactly like an empty search would, letting the caller retry
+// with a simplified term and, ultimately, trigger ingredient repair instead
+// of silently accepting an unrelated food.
+//
+// When foodCore is missing/null (older client, or the AI omitted it), falls
+// back to the original head-word-from-searchExpression heuristic unchanged,
+// including its blind fallback to the top-ranked result - a branded match
+// beats no match at all in that degraded mode.
+//
+// Word-overlap alone can't reliably tell a food apart from a manufactured
+// DERIVATIVE of it that happens to share every word - FatSecret carries Generic
+// entries for an oil/sauce/milk/powder/etc. version of countless base foods.
+// Confirmed live: requiring "sweet"+"basil" (a real variety name, not a
+// droppable modifier) matched Generic "Sweet Basil Oil" - a cooking oil at
+// 429kcal/50g - ahead of the correct "Basil" leaf entry at 9kcal/50g. No fixed
+// list of words to watch for generalizes to every food, so this is the
+// fallback tier only (see pickBestFoodMatchWithAI below for the primary path,
+// which asks the AI to judge the actual candidates directly instead of
+// guessing from word overlap).
+function pickFoodMatchByWords(searchExpression, foodCore, usable) {
+    const tokensOf = (name) => (name || '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
+    const wordMatchesTokens = (word, tokens) => {
+        if (tokens.includes(word)) return true;
+        if (word.endsWith('s') && tokens.includes(word.slice(0, -1))) return true;
+        if (!word.endsWith('s') && tokens.includes(word + 's')) return true;
+        return false;
+    };
+
+    const coreWords = (foodCore || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+
+    let nameMatches;
+    if (coreWords.length > 0) {
+        nameMatches = (name) => {
+            const tokens = tokensOf(name);
+            return coreWords.every(w => wordMatchesTokens(w, tokens));
+        };
+    } else {
+        const searchWords = searchExpression.trim().toLowerCase().split(/\s+/).filter(Boolean);
+        const headWord = searchWords[searchWords.length - 1] || '';
+        nameMatches = (name) => wordMatchesTokens(headWord, tokensOf(name));
+    }
+
+    const PROCESSED_FORM_WORDS = ['oil', 'sauce', 'syrup', 'juice', 'powder', 'extract', 'paste', 'butter', 'milk', 'flour', 'dried', 'chips', 'crisps', 'jam', 'jelly', 'cream', 'concentrate', 'spread', 'flakes'];
+    const ownWords = tokensOf(searchExpression);
+    const isProcessedFormMismatch = (name) => {
+        const tokens = tokensOf(name);
+        return PROCESSED_FORM_WORDS.some(w => tokens.includes(w) && !ownWords.includes(w));
+    };
+    const isAcceptable = (name) => nameMatches(name) && !isProcessedFormMismatch(name);
+
+    const genericMatch = usable.find(f => f.food_type === 'Generic' && isAcceptable(f.food_name));
+    if (genericMatch) return genericMatch;
+
+    if (coreWords.length === 0) return usable[0];
+
+    return usable.find(f => isAcceptable(f.food_name)) || null;
+}
+
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
+
+// Asks Gemini to judge, from the REAL FatSecret candidates for one search,
+// which one (if any) is genuinely the same food as the ingredient - this is
+// the primary match-acceptance check, replacing word-overlap guessing with
+// the same semantic judgment the AI that wrote the ingredient already has.
+// One call covers all candidates at once (not one call per candidate) so this
+// costs a single round-trip per ingredient, not up to five.
+//
+// Returns the chosen candidate object, or `null` when the AI says none of the
+// candidates are correct (a real "no match" - same as an empty search to the
+// caller, which falls through to the foodSimplified retry and eventually
+// ingredient repair). Throws on any call/parse failure (network error, missing
+// API key, unparseable response) - searchFoodItem catches that and falls back
+// to pickFoodMatchByWords, so a transient AI outage degrades gracefully
+// instead of breaking nutrition lookup entirely.
+async function pickBestFoodMatchWithAI(searchExpression, foodCore, candidates) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error('GEMINI_API_KEY not configured');
+
+    const listing = candidates.map((f, i) =>
+        `${i + 1}. "${f.food_name}" (${f.food_type})${f.food_description ? ` - ${f.food_description}` : ''}`
+    ).join('\n');
+
+    const prompt = `You are verifying a nutrition-database search result before it gets used to calculate calories/macros.
+Ingredient: "${searchExpression}"${foodCore ? ` (core food identity: "${foodCore}")` : ''}
+
+Candidate database entries:
+${listing}
+
+Which numbered entry, if any, is genuinely the SAME food as the ingredient? Reject an entry if it is actually a different processed/derived form (e.g. an oil, sauce, powder, dried, juice, milk, butter, syrup, extract, or paste version of the ingredient), a prepared dish, or an unrelated branded product that merely shares words with the ingredient - even if the name looks like a lexical match.
+
+Respond with ONLY the number of the correct entry, or 0 if none are correct. No explanation, no other text.`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    try {
+        const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: { temperature: 0 },
+                }),
+                signal: controller.signal,
+            }
+        );
+        if (!response.ok) throw new Error(`Gemini verification call returned ${response.status}`);
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+        const match = text.match(/\d+/);
+        if (!match) throw new Error(`Gemini verification returned unparseable response: "${text}"`);
+        const choice = parseInt(match[0], 10);
+        if (choice === 0) return null;
+        if (choice >= 1 && choice <= candidates.length) return candidates[choice - 1];
+        throw new Error(`Gemini verification returned out-of-range choice: ${choice}`);
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+async function searchFoodItem(searchExpression, token, foodCore) {
     const searchResponse = await fetchWithRetry('https://platform.fatsecret.com/rest/server.api', {
         method: 'POST',
         headers: {
@@ -586,16 +713,13 @@ async function searchFoodItem(searchExpression, token) {
     const usable = results.filter(f => f && f.food_id);
     if (usable.length === 0) return null;
 
-    const searchWords = searchExpression.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    const headWord = searchWords[searchWords.length - 1] || '';
-    const headWordSingular = headWord.replace(/s$/, '');
-    const nameContainsHead = (name) => {
-        const tokens = (name || '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
-        return tokens.includes(headWord) || tokens.includes(headWordSingular);
-    };
+    try {
+        return await pickBestFoodMatchWithAI(searchExpression, foodCore, usable);
+    } catch (err) {
+        console.warn(`[Free Search] AI match verification failed for "${searchExpression}", falling back to word-based matching:`, err.message);
+    }
 
-    const genericMatch = usable.find(f => f.food_type === 'Generic' && nameContainsHead(f.food_name));
-    return genericMatch || usable[0];
+    return pickFoodMatchByWords(searchExpression, foodCore, usable);
 }
 
 // Health Check Endpoint
@@ -617,13 +741,23 @@ app.get('/health', (req, res) => {
 
 // Nutrition Analysis Endpoint
 app.post('/api/nutrition/analyze', async (req, res) => {
-    const { ingredients } = req.body;
+    const { ingredients, foodCores } = req.body;
 
     if (!ingredients || !Array.isArray(ingredients)) {
         return res.status(400).json({ error: "ingredients must be an array of strings" });
     }
 
-    const cleanIngredients = ingredients.map(i => i.trim()).filter(i => i.length > 0);
+    // Pair each ingredient with its food_core (if any) before filtering out blank
+    // ingredients - filtering the two arrays independently risks shifting them out
+    // of index alignment.
+    const paired = ingredients
+        .map((ing, i) => ({
+            ingredient: (ing || '').trim(),
+            foodCore: Array.isArray(foodCores) ? (foodCores[i] || null) : null
+        }))
+        .filter(p => p.ingredient.length > 0);
+    const cleanIngredients = paired.map(p => p.ingredient);
+    const cleanFoodCores = paired.map(p => p.foodCore);
     if (cleanIngredients.length === 0) {
         return res.json({ calories: 0, protein: 0, carbs: 0, fat: 0 });
     }
@@ -756,7 +890,9 @@ app.post('/api/nutrition/analyze', async (req, res) => {
         // omit foods it failed to look up.
         const unresolvedIngredients = [];
 
-        for (const ingStr of cleanIngredients) {
+        for (let ingIndex = 0; ingIndex < cleanIngredients.length; ingIndex++) {
+            const ingStr = cleanIngredients[ingIndex];
+            const foodCore = cleanFoodCores[ingIndex];
             // Small pacing gap between ingredients (not before the first one) so a
             // big multi-day plan doesn't fire a burst of requests back-to-back and
             // trip a rate limit in the first place - cheap insurance on top of the
@@ -794,12 +930,30 @@ app.post('/api/nutrition/analyze', async (req, res) => {
                 // Primary search: the food phrase exactly as the ingredient wrote it,
                 // cooking-method words included ("baked potato", "boiled potatoes") -
                 // those words select the correct database entry. Fallback search: the
-                // simplified term with leading descriptors stripped, tried only when
-                // the full phrase matched nothing at all.
-                foodItem = await searchFoodItem(parsedIng.food, token);
+                // mechanically-simplified term with leading descriptors stripped, tried
+                // only when the full phrase matched nothing at all.
+                foodItem = await searchFoodItem(parsedIng.food, token, foodCore);
                 if (!foodItem && parsedIng.foodSimplified) {
                     console.log(`[Free Search] No result for "${parsedIng.food}", retrying simplified: "${parsedIng.foodSimplified}"`);
-                    foodItem = await searchFoodItem(parsedIng.foodSimplified, token);
+                    foodItem = await searchFoodItem(parsedIng.foodSimplified, token, foodCore);
+                }
+                // Last-resort fallback: search on food_core itself. It's the AI's own
+                // judgment of the food's minimal identity, already stripped of style/prep
+                // words ("shredded", "minced"...) the same way it strips "fresh" - a better
+                // simplification than fillerWords' fixed list could ever mechanically
+                // guess, and it catches phrases fillerWords has no entry for at all (e.g.
+                // "shredded coconut" -> foodSimplified stays null since "shredded" isn't in
+                // that list, so this is the only fallback that ever fires for it). Skipped
+                // when it's identical to a term already tried, to avoid a redundant search.
+                if (!foodItem && foodCore) {
+                    const alreadyTried = [parsedIng.food, parsedIng.foodSimplified]
+                        .filter(Boolean)
+                        .map(s => s.trim().toLowerCase());
+                    const coreNormalized = foodCore.trim().toLowerCase();
+                    if (coreNormalized && !alreadyTried.includes(coreNormalized)) {
+                        console.log(`[Free Search] No result for "${parsedIng.food}", retrying with food_core: "${foodCore}"`);
+                        foodItem = await searchFoodItem(foodCore, token, foodCore);
+                    }
                 }
                 if (!foodItem) {
                     console.warn(`[Free Search] No search result found for "${parsedIng.food}"`);
