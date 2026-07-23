@@ -153,17 +153,28 @@ function parseIngredient(str) {
         'large', 'medium', 'small', 'whole'
     ];
 
+    // "whole" is ambiguous: a serving-size word ("1 whole egg") when it precedes
+    // the food itself, but part of a compound food NAME ("whole wheat", "whole
+    // grain", "whole milk") when it precedes one of these - in that case it must
+    // stay in the food name, both for the FatSecret search (searching "whole
+    // wheat roti" finds a real Generic "Roti" entry; the stripped "wheat roti"
+    // does not - confirmed live) and because it isn't really sizing a single
+    // count of anything (this exact confusion drove the CONVERSIONS['whole']
+    // fallback bug fixed earlier today).
+    const WHOLE_COMPOUND_FOLLOWERS = ['wheat', 'grain', 'grains', 'milk'];
+    const isWholeCompound = (w) => w[0] === 'whole' && WHOLE_COMPOUND_FOLLOWERS.includes(w[1]);
+
     let unit = null;
     let food = rest;
 
     const words = rest.split(/\s+/);
-    if (words.length > 0 && units.includes(words[0])) {
+    if (words.length > 0 && units.includes(words[0]) && !isWholeCompound(words)) {
         unit = words[0];
         food = words.slice(1).join(' ');
     } else {
         const stuckUnitRegex = /^([a-zA-Z]+)\s*(.*)$/;
         const stuckMatch = rest.match(stuckUnitRegex);
-        if (stuckMatch && units.includes(stuckMatch[1])) {
+        if (stuckMatch && units.includes(stuckMatch[1]) && !isWholeCompound([stuckMatch[1], stuckMatch[2].trim().split(/\s+/)[0]])) {
             unit = stuckMatch[1];
             food = stuckMatch[2];
         }
@@ -527,9 +538,28 @@ async function fetchWithRetry(url, options, { retries = 3, baseDelayMs = 500 } =
     return lastResponse;
 }
 
-// One foods.search call, reduced to its useful outcome: the top matching food item,
-// or null (HTTP failure or empty result set both mean "this term found nothing usable"
-// to the caller, which decides whether to retry with a different term).
+// One foods.search call, reduced to its useful outcome: the best matching food
+// item, or null (HTTP failure or empty result set both mean "this term found
+// nothing usable" to the caller, which decides whether to retry with a
+// different term).
+//
+// Requests several results instead of just the top one, and prefers a
+// food_type "Generic" entry over a "Brand" one when both are present - a
+// same-named restaurant/brand can easily outrank the actual generic food
+// (confirmed live: searching the exact word "roti" returned a "Roti
+// Mediterranean Grill" restaurant chain's branded pita bread as the #1
+// result, ahead of any real roti/chapati entry).
+//
+// IMPORTANT: "prefer whichever Generic result comes first" is not enough on
+// its own - confirmed live, for "whole wheat rotis" the first Generic result
+// was "Whole Wheat Bagel", which is Generic but simply the wrong food (shares
+// "whole wheat" with the search, not the food itself). A Generic candidate
+// only overrides the top result when its own name contains the search
+// phrase's head noun (its last word, singular or plural) - the word that
+// actually names the food, as opposed to leading modifiers like "whole
+// wheat"/"lean"/"boiled" that many unrelated foods also share. Falls back to
+// whatever ranked first when no Generic candidate passes that check - a
+// branded match beats no match at all.
 async function searchFoodItem(searchExpression, token) {
     const searchResponse = await fetchWithRetry('https://platform.fatsecret.com/rest/server.api', {
         method: 'POST',
@@ -541,7 +571,7 @@ async function searchFoodItem(searchExpression, token) {
             method: 'foods.search',
             search_expression: searchExpression,
             format: 'json',
-            max_results: '1'
+            max_results: '5'
         })
     });
 
@@ -551,8 +581,21 @@ async function searchFoodItem(searchExpression, token) {
     }
 
     const searchData = await searchResponse.json();
-    const foodItem = searchData.foods?.food?.[0] || searchData.foods?.food;
-    return foodItem && foodItem.food_id ? foodItem : null;
+    const rawResults = searchData.foods?.food;
+    const results = Array.isArray(rawResults) ? rawResults : (rawResults ? [rawResults] : []);
+    const usable = results.filter(f => f && f.food_id);
+    if (usable.length === 0) return null;
+
+    const searchWords = searchExpression.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const headWord = searchWords[searchWords.length - 1] || '';
+    const headWordSingular = headWord.replace(/s$/, '');
+    const nameContainsHead = (name) => {
+        const tokens = (name || '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
+        return tokens.includes(headWord) || tokens.includes(headWordSingular);
+    };
+
+    const genericMatch = usable.find(f => f.food_type === 'Generic' && nameContainsHead(f.food_name));
+    return genericMatch || usable[0];
 }
 
 // Health Check Endpoint
