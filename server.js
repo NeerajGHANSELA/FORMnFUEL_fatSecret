@@ -169,18 +169,26 @@ function parseIngredient(str) {
         }
     }
 
-    // Clean leading descriptive words to improve search matching
+    // The food phrase is kept EXACTLY as written for the primary FatSecret search:
+    // cooking-method words select genuinely different database entries with different
+    // macros ("baked potato" is a real entry at ~0.1g fat/100g; stripping "baked" and
+    // searching bare "potato" matched "Roasted Potato" at ~7g fat/100g - confirmed
+    // live as ~29g of phantom fat in one dinner). A simplified variant with leading
+    // descriptor words removed is kept ONLY as a fallback search term for when the
+    // full phrase matches nothing at all.
     const fillerWords = ['cooked', 'raw', 'grilled', 'boiled', 'baked', 'fried', 'diced', 'sliced', 'chopped', 'fresh', 'organic'];
     let foodWords = food.split(/\s+/);
     while (foodWords.length > 0 && fillerWords.includes(foodWords[0])) {
         foodWords.shift();
     }
-    food = foodWords.join(' ');
+    const simplified = foodWords.join(' ');
 
     return {
         quantity,
         unit,
         food: food || rest,
+        // Fallback-only search term; null when stripping changed nothing (or ate everything).
+        foodSimplified: simplified && simplified !== food ? simplified : null,
         aiGrams,
         aiMax
     };
@@ -519,6 +527,34 @@ async function fetchWithRetry(url, options, { retries = 3, baseDelayMs = 500 } =
     return lastResponse;
 }
 
+// One foods.search call, reduced to its useful outcome: the top matching food item,
+// or null (HTTP failure or empty result set both mean "this term found nothing usable"
+// to the caller, which decides whether to retry with a different term).
+async function searchFoodItem(searchExpression, token) {
+    const searchResponse = await fetchWithRetry('https://platform.fatsecret.com/rest/server.api', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: new URLSearchParams({
+            method: 'foods.search',
+            search_expression: searchExpression,
+            format: 'json',
+            max_results: '1'
+        })
+    });
+
+    if (!searchResponse.ok) {
+        console.warn(`[Free Search] FatSecret search failed for "${searchExpression}":`, searchResponse.status);
+        return null;
+    }
+
+    const searchData = await searchResponse.json();
+    const foodItem = searchData.foods?.food?.[0] || searchData.foods?.food;
+    return foodItem && foodItem.food_id ? foodItem : null;
+}
+
 // Health Check Endpoint
 app.get('/health', (req, res) => {
     res.json({
@@ -712,29 +748,17 @@ app.post('/api/nutrition/analyze', async (req, res) => {
             let searchWasCached = !!foodItem;
 
             if (!foodItem) {
-                const searchResponse = await fetchWithRetry('https://platform.fatsecret.com/rest/server.api', {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${token}`,
-                        'Content-Type': 'application/x-www-form-urlencoded'
-                    },
-                    body: new URLSearchParams({
-                        method: 'foods.search',
-                        search_expression: parsedIng.food,
-                        format: 'json',
-                        max_results: '1'
-                    })
-                });
-
-                if (!searchResponse.ok) {
-                    console.warn(`[Free Search] FatSecret search failed for "${parsedIng.food}":`, searchResponse.status);
-                    unresolvedIngredients.push(ingStr);
-                    continue;
+                // Primary search: the food phrase exactly as the ingredient wrote it,
+                // cooking-method words included ("baked potato", "boiled potatoes") -
+                // those words select the correct database entry. Fallback search: the
+                // simplified term with leading descriptors stripped, tried only when
+                // the full phrase matched nothing at all.
+                foodItem = await searchFoodItem(parsedIng.food, token);
+                if (!foodItem && parsedIng.foodSimplified) {
+                    console.log(`[Free Search] No result for "${parsedIng.food}", retrying simplified: "${parsedIng.foodSimplified}"`);
+                    foodItem = await searchFoodItem(parsedIng.foodSimplified, token);
                 }
-
-                const searchData = await searchResponse.json();
-                foodItem = searchData.foods?.food?.[0] || searchData.foods?.food;
-                if (!foodItem || !foodItem.food_id) {
+                if (!foodItem) {
                     console.warn(`[Free Search] No search result found for "${parsedIng.food}"`);
                     unresolvedIngredients.push(ingStr);
                     continue;
