@@ -608,7 +608,12 @@ function pickFoodMatchByWords(searchExpression, foodCore, usable) {
         nameMatches = (name) => wordMatchesTokens(headWord, tokensOf(name));
     }
 
-    const PROCESSED_FORM_WORDS = ['oil', 'sauce', 'syrup', 'juice', 'powder', 'extract', 'paste', 'butter', 'milk', 'flour', 'dried', 'chips', 'crisps', 'jam', 'jelly', 'cream', 'concentrate', 'spread', 'flakes'];
+    // 'powder' and 'milk' deliberately excluded: they're the normal, correct way
+    // FatSecret names whole categories of real foods (protein powder, cocoa
+    // powder, whole/2%/nonfat milk yogurt and cheese), not just a sign of a
+    // different derived product - blindly rejecting them broke verification for
+    // completely ordinary ingredients like "whey protein" and "greek yogurt".
+    const PROCESSED_FORM_WORDS = ['oil', 'sauce', 'syrup', 'juice', 'extract', 'paste', 'butter', 'flour', 'dried', 'chips', 'crisps', 'jam', 'jelly', 'cream', 'concentrate', 'spread', 'flakes'];
     const ownWords = tokensOf(searchExpression);
     const isProcessedFormMismatch = (name) => {
         const tokens = tokensOf(name);
@@ -654,7 +659,7 @@ Ingredient: "${searchExpression}"${foodCore ? ` (core food identity: "${foodCore
 Candidate database entries:
 ${listing}
 
-Which numbered entry, if any, is genuinely the SAME food as the ingredient? Reject an entry if it is actually a different processed/derived form (e.g. an oil, sauce, powder, dried, juice, milk, butter, syrup, extract, or paste version of the ingredient), a prepared dish, or an unrelated branded product that merely shares words with the ingredient - even if the name looks like a lexical match.
+Which numbered entry, if any, is genuinely the SAME food as the ingredient? Reject an entry only if it is a categorically different product derived FROM the ingredient (e.g. the ingredient is a whole fruit/nut/vegetable but the candidate is its oil, juice, sauce, syrup, extract, or paste), a prepared dish, or an unrelated branded product that merely shares words with the ingredient. Do NOT reject a candidate just because its name includes a qualifier describing that same food's own normal composition or how it's typically sold (e.g. "whey protein powder" IS whey protein - protein supplements are normally sold as powder; "whole milk greek yogurt" IS greek yogurt - milk-fat content is a descriptor, not a different product).
 
 Respond with ONLY the number of the correct entry, or 0 if none are correct. No explanation, no other text.`;
 
@@ -685,6 +690,86 @@ Respond with ONLY the number of the correct entry, or 0 if none are correct. No 
     } finally {
         clearTimeout(timeoutId);
     }
+}
+
+// Last-resort macro source for an ingredient that genuinely has no FatSecret
+// match at all (not even after the caller has already retried with a
+// different, more common ingredient) - asks Gemini for the ingredient's real
+// per-serving macros instead of failing the whole plan over one obscure food.
+//
+// Only asks the AI for protein/carbs/fat, never calories directly - calories
+// is derived here from those three (4/4/9) so it can't disagree with them,
+// the same "let the AI classify, let code compute" principle already used for
+// FatSecret's own density backstop below. Two independent plausibility gates
+// before this is trusted: an absolute per-macro ceiling (works for any unit),
+// plus the existing energy-density ceiling when the ingredient's unit
+// converts cleanly to grams (g/kg/oz/ml) - ambiguous units like "scoop" skip
+// that second gate rather than guess a gram weight for it, same fallback
+// `isPlausible` already uses when it has no reference grams.
+async function estimateIngredientMacrosWithAI(ingredientStr, foodCore) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error('GEMINI_API_KEY not configured');
+
+    const prompt = `You are a nutrition database, answering with the real-world macronutrient content of a food ingredient exactly as commonly known - not a rough guess.
+
+Ingredient, with its stated quantity: "${ingredientStr}"${foodCore ? ` (food identity: "${foodCore}")` : ''}
+
+Using standard nutrition data for this food, respond with ONLY the protein, carbohydrate, and fat content in grams for exactly the quantity stated - no other text, strict JSON, no markdown fences:
+{"protein": 0, "carbs": 0, "fat": 0}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    let text;
+    try {
+        const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: { temperature: 0 },
+                }),
+                signal: controller.signal,
+            }
+        );
+        if (!response.ok) throw new Error(`Gemini estimate call returned ${response.status}`);
+        const data = await response.json();
+        text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+    } finally {
+        clearTimeout(timeoutId);
+    }
+
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error(`Gemini estimate returned unparseable response: "${text}"`);
+    const parsed = JSON.parse(jsonMatch[0]);
+    const protein = Number(parsed.protein);
+    const carbs = Number(parsed.carbs);
+    const fat = Number(parsed.fat);
+
+    // No single recipe ingredient realistically supplies more than this of any
+    // one macro - catches a wildly hallucinated figure regardless of unit.
+    const MAX_MACRO_GRAMS = 500;
+    if (![protein, carbs, fat].every(n => Number.isFinite(n) && n >= 0 && n <= MAX_MACRO_GRAMS)) {
+        return null;
+    }
+    const calories = protein * 4 + carbs * 4 + fat * 9;
+
+    const parsedIng = parseIngredient(ingredientStr);
+    const grams = toGrams(parsedIng.quantity, parsedIng.unit);
+    if (!isPlausible({ calories }, grams)) return null;
+
+    return {
+        ingredient: ingredientStr,
+        food_name: `${parsedIng.food || ingredientStr} (AI estimate - not in nutrition database)`,
+        calories: Math.round(calories),
+        protein: Math.round(protein),
+        carbs: Math.round(carbs),
+        fat: Math.round(fat),
+        referenceServingGrams: null,
+        referenceServingUnit: null,
+        gramsPerOriginalUnit: null,
+    };
 }
 
 async function searchFoodItem(searchExpression, token, foodCore) {
@@ -1093,6 +1178,52 @@ app.post('/api/nutrition/analyze', async (req, res) => {
         console.error("FatSecret Proxy integration failure:", err);
         return res.status(500).json({ error: "Internal proxy server error: " + err.message });
     }
+});
+
+// Last-resort estimate endpoint - the caller (DietSetupFlow) only reaches for
+// this after /api/nutrition/analyze has already failed to resolve an
+// ingredient AND a repair attempt with a different, more common ingredient
+// has ALSO failed. Deliberately separate from /api/nutrition/analyze rather
+// than an automatic fallback inside it, so a real database match is always
+// preferred and this only fires for the genuinely unresolvable remainder.
+app.post('/api/nutrition/estimate', async (req, res) => {
+    const { ingredients, foodCores } = req.body;
+
+    if (!ingredients || !Array.isArray(ingredients)) {
+        return res.status(400).json({ error: "ingredients must be an array of strings" });
+    }
+
+    const paired = ingredients
+        .map((ing, i) => ({
+            ingredient: (ing || '').trim(),
+            foodCore: Array.isArray(foodCores) ? (foodCores[i] || null) : null
+        }))
+        .filter(p => p.ingredient.length > 0);
+
+    const items = [];
+    const failed = [];
+
+    for (let i = 0; i < paired.length; i++) {
+        // Same pacing gap as /api/nutrition/analyze - avoid bursting requests.
+        if (i > 0) await new Promise(resolve => setTimeout(resolve, 120));
+
+        const { ingredient, foodCore } = paired[i];
+        try {
+            const item = await estimateIngredientMacrosWithAI(ingredient, foodCore);
+            if (item) {
+                console.log(`[AI Estimate] "${ingredient}" -> ${item.calories} kcal (P${item.protein}/C${item.carbs}/F${item.fat})`);
+                items.push(item);
+            } else {
+                console.warn(`[AI Estimate] Implausible or unparseable estimate for "${ingredient}"`);
+                failed.push(ingredient);
+            }
+        } catch (err) {
+            console.warn(`[AI Estimate] Failed to estimate "${ingredient}":`, err.message);
+            failed.push(ingredient);
+        }
+    }
+
+    return res.json({ items, failed });
 });
 
 app.listen(PORT, () => {
