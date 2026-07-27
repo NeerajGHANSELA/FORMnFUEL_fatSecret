@@ -9,7 +9,13 @@ const PORT = process.env.PORT || 4000;
 const USE_NATIVE_NLP = process.env.USE_NATIVE_NLP === 'true';
 
 app.use(cors());
-app.use(express.json());
+// 25mb, not the 100kb default: /api/ai/generate forwards Gemini requests that
+// can carry up to four body-composition photos as base64 inlineData. This has
+// to be set HERE rather than as a per-route express.json({limit}) — this global
+// parser runs first for every route, so it would 413 the request before any
+// route-level limit was ever consulted (confirmed: a 2MB body was rejected with
+// a route-level 25mb limit in place).
+app.use(express.json({ limit: '25mb' }));
 
 // In-memory token storage
 let cachedToken = null;
@@ -629,6 +635,14 @@ function pickFoodMatchByWords(searchExpression, foodCore, usable) {
     return usable.find(f => isAcceptable(f.food_name)) || null;
 }
 
+// Deliberately a cheap/high-quota model, NOT the one the diet-plan generator
+// uses. The two AI calls here (pickBestFoodMatchWithAI,
+// estimateIngredientMacrosWithAI) fire ONCE PER INGREDIENT, so a single 28-meal
+// plan drives ~120+ calls through this file — two orders of magnitude more
+// than the whole app-side generation pipeline. Pointing this at a
+// low-request-quota model exhausts the daily quota within one plan
+// generation. These are simple matching/estimation tasks; Flash-Lite is the
+// right tier for them regardless of what the plan generator runs on.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
 
 // Asks Gemini to judge, from the REAL FatSecret candidates for one search,
@@ -822,6 +836,65 @@ app.get('/health', (req, res) => {
             detailEntries: foodDetailCache.size
         }
     });
+});
+
+// ---------------------------------------------------------------------------
+// Gemini generateContent proxy
+// ---------------------------------------------------------------------------
+// Exists so the app never has to hold a Gemini API key. Previously the client
+// called generativelanguage.googleapis.com directly using
+// EXPO_PUBLIC_GEMINI_API_KEY — and any EXPO_PUBLIC_* value is compiled into the
+// shipped app bundle, so that key was extractable from any installed copy of
+// the app and chargeable to us. The key now lives only here, server-side.
+//
+// Deliberately a thin pass-through: the caller still owns the prompt,
+// generationConfig and (optionally) the model, so adding/'changing a prompt
+// never needs a proxy change. Only the credential moves.
+// Body-size note: the limit for this route is set on the GLOBAL express.json()
+// at the top of this file, not here — see the comment there for why a
+// route-level limit doesn't work.
+app.post('/api/ai/generate', async (req, res) => {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+        return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured on the proxy server.' } });
+    }
+
+    const { contents, generationConfig, model } = req.body || {};
+    if (!Array.isArray(contents) || contents.length === 0) {
+        return res.status(400).json({ error: { message: 'Request must include a non-empty "contents" array.' } });
+    }
+
+    // Allow the caller to pick a model, but only from a known-good set — an
+    // unvalidated passthrough would let anyone who can reach this proxy bill us
+    // for an arbitrarily expensive model.
+    const ALLOWED_MODELS = new Set(['gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']);
+    const chosenModel = model && ALLOWED_MODELS.has(model) ? model : GEMINI_MODEL;
+
+    try {
+        // No timeout here on purpose: the client already owns the deadline via
+        // its own AbortController, and aborting client-side tears down this
+        // request too. A second, shorter timeout here would just truncate long
+        // (but healthy) generations — a 3.6-flash draft legitimately runs ~70s.
+        const geminiResponse = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${chosenModel}:generateContent?key=${apiKey}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contents, generationConfig }),
+            }
+        );
+
+        // Mirror Gemini's status so the app's existing handling (429 quota
+        // messaging, 5xx retry in fetchGeminiWithRetry) keeps working unchanged.
+        const data = await geminiResponse.json().catch(() => ({}));
+        if (!geminiResponse.ok) {
+            console.warn(`[AI Proxy] Gemini returned ${geminiResponse.status} for model ${chosenModel}`);
+        }
+        return res.status(geminiResponse.status).json(data);
+    } catch (err) {
+        console.error('[AI Proxy] Request failed:', err.message || err);
+        return res.status(502).json({ error: { message: `Could not reach the AI service: ${err.message || err}` } });
+    }
 });
 
 // Nutrition Analysis Endpoint
