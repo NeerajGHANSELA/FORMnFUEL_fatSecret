@@ -17,6 +17,80 @@ app.use(cors());
 // a route-level 25mb limit in place).
 app.use(express.json({ limit: '25mb' }));
 
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+// Every endpoint below that reaches a PAID third-party API is gated on a valid
+// Supabase user token.
+//
+// Moving the Gemini key server-side (see /api/ai/generate) protected the KEY.
+// It did nothing for the SPEND: with no auth, anyone who learned this server's
+// URL could POST to it and bill our account. /api/ai/generate is deliberately a
+// thin pass-through — the caller supplies the prompt, the model and the config —
+// so an open deployment is not merely "an attacker can use our features", it is
+// a free general-purpose Gemini endpoint charged to us, accepting 25 MB bodies.
+//
+// Verifying the caller's Supabase JWT rather than checking a shared secret: a
+// shared secret would have to ship inside the app bundle, which is precisely
+// the extraction problem the proxy was built to solve, so it would only raise
+// the bar. The app already signs in to Supabase, so every real request already
+// carries a token that identifies a real account — and that also makes
+// per-user rate limiting possible later, which a shared secret never could.
+//
+// Verification goes through supabase.auth.getUser() rather than checking a
+// signature locally with the JWT secret: it needs no secret on this box, it
+// works whatever algorithm the project signs with, and it respects revocation
+// (a locally-verified signature keeps accepting a token from a deleted or
+// signed-out user until it expires).
+const { createClient } = require('@supabase/supabase-js');
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
+const supabaseAuth = SUPABASE_URL && SUPABASE_ANON_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false } })
+    : null;
+
+if (!supabaseAuth) {
+    console.warn(
+        '[auth] SUPABASE_URL / SUPABASE_ANON_KEY are not set — every paid endpoint will REFUSE requests. ' +
+        'This is deliberate: a misconfigured proxy must fail closed, never open.',
+    );
+}
+
+/**
+ * Rejects anything without a valid Supabase user token.
+ *
+ * FAILS CLOSED. If this server is misconfigured the endpoints return 503 rather
+ * than serving unauthenticated traffic — the failure mode of an auth check that
+ * falls back to "allow" is an open, billable endpoint that looks fine.
+ */
+const requireUser = async (req, res, next) => {
+    if (!supabaseAuth) {
+        return res.status(503).json({ error: { message: 'Server auth is not configured.' } });
+    }
+
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+    if (!token) {
+        return res.status(401).json({ error: { message: 'Missing bearer token.' } });
+    }
+
+    try {
+        const { data, error } = await supabaseAuth.auth.getUser(token);
+        if (error || !data?.user) {
+            return res.status(401).json({ error: { message: 'Invalid or expired token.' } });
+        }
+        // Downstream handlers and logs can attribute spend to a real account.
+        req.userId = data.user.id;
+        return next();
+    } catch (err) {
+        // A network failure talking to Supabase is NOT permission to proceed.
+        console.warn('[auth] Token verification failed:', err?.message || err);
+        return res.status(503).json({ error: { message: 'Could not verify credentials.' } });
+    }
+};
+
 // In-memory token storage
 let cachedToken = null;
 let tokenExpiry = 0; // Epoch timestamp in ms
@@ -853,7 +927,7 @@ app.get('/health', (req, res) => {
 // Body-size note: the limit for this route is set on the GLOBAL express.json()
 // at the top of this file, not here — see the comment there for why a
 // route-level limit doesn't work.
-app.post('/api/ai/generate', async (req, res) => {
+app.post('/api/ai/generate', requireUser, async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured on the proxy server.' } });
@@ -898,7 +972,7 @@ app.post('/api/ai/generate', async (req, res) => {
 });
 
 // Nutrition Analysis Endpoint
-app.post('/api/nutrition/analyze', async (req, res) => {
+app.post('/api/nutrition/analyze', requireUser, async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
     if (!ingredients || !Array.isArray(ingredients)) {
@@ -1259,7 +1333,7 @@ app.post('/api/nutrition/analyze', async (req, res) => {
 // has ALSO failed. Deliberately separate from /api/nutrition/analyze rather
 // than an automatic fallback inside it, so a real database match is always
 // preferred and this only fires for the genuinely unresolvable remainder.
-app.post('/api/nutrition/estimate', async (req, res) => {
+app.post('/api/nutrition/estimate', requireUser, async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
     if (!ingredients || !Array.isArray(ingredients)) {
