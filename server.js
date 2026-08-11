@@ -717,7 +717,15 @@ function pickFoodMatchByWords(searchExpression, foodCore, usable) {
 // low-request-quota model exhausts the daily quota within one plan
 // generation. These are simple matching/estimation tasks; Flash-Lite is the
 // right tier for them regardless of what the plan generator runs on.
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
+// Fallback only — the app names a model on every request, and the handler below
+// honours it whenever it appears in ALLOWED_MODELS. This is what gets used if a
+// caller sends nothing, or sends something unrecognised.
+//
+// ⚠️ Kept identical to the app's default in lib/geminiProxy.ts. It was
+// gemini-3.1-flash-lite while the app defaulted to gemini-3.6-flash, which made
+// the substitution silent AND a downgrade: an unrecognised model name would not
+// fail, it would quietly answer from a weaker one. Change both together.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 
 // Asks Gemini to judge, from the REAL FatSecret candidates for one search,
 // which one (if any) is genuinely the same food as the ingredient - this is
