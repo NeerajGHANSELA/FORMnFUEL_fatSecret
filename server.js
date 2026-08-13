@@ -868,6 +868,34 @@ Using standard nutrition data for this food, respond with ONLY the protein, carb
     };
 }
 
+/**
+ * FatSecret's failures arrive as HTTP 200 with an `error` envelope.
+ *
+ * ⚠️ THIS COST A FULL EVENING TO FIND, AND IT WAS INVISIBLE THE WHOLE TIME.
+ * `{"error":{"code":21,"message":"Invalid IP address detected"}}` comes back
+ * with a 200, so `response.ok` is TRUE, the `!ok` guard never fires, and the
+ * parse below finds no `foods.food` key and concludes "no results for this
+ * ingredient". The proxy could not tell a total outage from a food FatSecret
+ * genuinely does not stock.
+ *
+ * What the user saw was the app blaming their ingredients — "couldn't verify
+ * 220 g chicken breast" — after an eight-minute wait, while the real answer
+ * (an IP allowlist rejecting every call for 46 hours) was in a response body
+ * nobody read.
+ *
+ * Codes worth recognising on sight: 21 = calling IP not on the allowlist,
+ * 12 = missing/invalid oauth token, 13 = invalid signature, 14 = expired.
+ *
+ * Returns the error so callers can bail, and logs at ERROR — this is never
+ * normal, and it must never look like an empty result set again.
+ */
+function fatSecretError(data, context) {
+    const err = data && data.error;
+    if (!err) return null;
+    console.error(`[FatSecret] ${context} FAILED — code ${err.code}: ${err.message}`);
+    return err;
+}
+
 async function searchFoodItem(searchExpression, token, foodCore) {
     const searchResponse = await fetchWithRetry('https://platform.fatsecret.com/rest/server.api', {
         method: 'POST',
@@ -889,6 +917,9 @@ async function searchFoodItem(searchExpression, token, foodCore) {
     }
 
     const searchData = await searchResponse.json();
+    // Before reading results: a rejection arrives here as a 200 with an error
+    // envelope, and would otherwise parse as "no matches". See fatSecretError.
+    if (fatSecretError(searchData, `foods.search "${searchExpression}"`)) return null;
     const rawResults = searchData.foods?.food;
     const results = Array.isArray(rawResults) ? rawResults : (rawResults ? [rawResults] : []);
     const usable = results.filter(f => f && f.food_id);
@@ -903,9 +934,31 @@ async function searchFoodItem(searchExpression, token, foodCore) {
     return pickFoodMatchByWords(searchExpression, foodCore, usable);
 }
 
-// Health Check Endpoint
-app.get('/health', (req, res) => {
-    res.json({
+/**
+ * The deep probe's last answer, so polling cannot burn FatSecret quota.
+ *
+ * A real lookup costs an API call against a quota the whole app shares, and
+ * /health is unauthenticated — without this, anything that polls it every few
+ * seconds spends the allowance the meal generator needs.
+ */
+let lastDeepProbe = null;
+const DEEP_PROBE_TTL_MS = 60_000;
+
+/**
+ * Health check. `?deep=1` makes it mean something.
+ *
+ * ⚠️ THE SHALLOW ANSWER IS NEARLY USELESS AND HAS ALREADY MISLED US. It reports
+ * `hasClientId: true` and `status: "ok"` when the credentials merely EXIST —
+ * which is exactly what it said for 46 hours while FatSecret rejected every
+ * single call on an IP allowlist. The one field that hinted at the truth was
+ * `foodCache`, sitting at zero, and only because nothing had ever succeeded.
+ *
+ * The deep probe does one real `foods.search` and reports what came back, so
+ * "is the nutrition service actually working" becomes a question with an
+ * answer rather than an inference.
+ */
+app.get('/health', async (req, res) => {
+    const body = {
         status: "ok",
         uptime: process.uptime(),
         nativeNlpMode: USE_NATIVE_NLP,
@@ -917,7 +970,42 @@ app.get('/health', (req, res) => {
             searchEntries: foodSearchCache.size,
             detailEntries: foodDetailCache.size
         }
-    });
+    };
+
+    if (req.query.deep !== '1') return res.json(body);
+
+    if (lastDeepProbe && Date.now() - lastDeepProbe.at < DEEP_PROBE_TTL_MS) {
+        return res.json({ ...body, status: lastDeepProbe.result.ok ? 'ok' : 'degraded', fatSecret: { ...lastDeepProbe.result, cached: true } });
+    }
+
+    let result;
+    try {
+        const token = await getFatSecretToken();
+        const started = Date.now();
+        const probe = await fetch('https://platform.fatsecret.com/rest/server.api', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                method: 'foods.search',
+                // A food FatSecret certainly stocks, so an empty result set can
+                // only mean something is wrong rather than an obscure query.
+                search_expression: 'chicken breast',
+                format: 'json',
+                max_results: '1'
+            })
+        });
+        const data = await probe.json().catch(() => ({}));
+        const elapsedMs = Date.now() - started;
+        const err = fatSecretError(data, 'health probe');
+        result = err
+            ? { ok: false, code: err.code, message: err.message, elapsedMs }
+            : { ok: !!data?.foods?.food, matched: data?.foods?.food?.food_name ?? null, elapsedMs };
+    } catch (e) {
+        result = { ok: false, message: e.message || String(e) };
+    }
+
+    lastDeepProbe = { at: Date.now(), result };
+    return res.json({ ...body, status: result.ok ? 'ok' : 'degraded', fatSecret: result });
 });
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1040,41 @@ app.post('/api/ai/generate', requireUser, async (req, res) => {
     const ALLOWED_MODELS = new Set(['gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']);
     const chosenModel = model && ALLOWED_MODELS.has(model) ? model : GEMINI_MODEL;
 
+    /**
+     * Timing, because "the AI took too long" is otherwise unanswerable.
+     *
+     * The app aborts a generation at 180s and shows "Our AI engine took too
+     * long to respond" — but the app owns that deadline, so from here the
+     * request simply stops existing. Nothing on either side records how long it
+     * had actually been running, which model it was, or how big the ask was.
+     *
+     * ⚠️ THIS IS THE ONLY PLACE THAT CAN SEE IT FOR EXISTING INSTALLS. Builds
+     * shipped before expo-updates cannot be fixed or instrumented remotely, and
+     * the tester who reported the timeout is on one. The proxy sees every
+     * request from every build.
+     *
+     * `promptChars` is what distinguishes the calls: the main draft's prompt is
+     * far larger than a repair round's or the instructions pass, and the app
+     * sends no label.
+     */
+    const startedAt = Date.now();
+    const promptChars = JSON.stringify(contents).length;
+
+    /**
+     * The client giving up is the event worth catching, and it arrives as a
+     * closed socket rather than an error. Registered BEFORE the await, or the
+     * abort can land while we are still setting up and go unlogged.
+     */
+    req.on('close', () => {
+        if (!res.writableEnded) {
+            console.warn(
+                `[AI Proxy] CLIENT ABORTED after ${Date.now() - startedAt}ms — ` +
+                `model ${chosenModel}, prompt ${promptChars} chars. ` +
+                `This is the app's 180s deadline firing.`
+            );
+        }
+    });
+
     try {
         // No timeout here on purpose: the client already owns the deadline via
         // its own AbortController, and aborting client-side tears down this
@@ -969,14 +1092,59 @@ app.post('/api/ai/generate', requireUser, async (req, res) => {
         // Mirror Gemini's status so the app's existing handling (429 quota
         // messaging, 5xx retry in fetchGeminiWithRetry) keeps working unchanged.
         const data = await geminiResponse.json().catch(() => ({}));
+        const elapsedMs = Date.now() - startedAt;
+        const replyChars = (data?.candidates?.[0]?.content?.parts?.[0]?.text || '').length;
+
+        // One line per call, always — a slow SUCCESS is the number that says
+        // whether 180s is a sane ceiling or a coin toss, and it never shows up
+        // if only failures are logged. Note the app retries 5xx up to twice
+        // INSIDE its single 180s budget, so several of these lines can belong
+        // to one user-visible generation.
+        console.log(
+            `[AI Proxy] ${chosenModel} ${geminiResponse.status} in ${elapsedMs}ms — ` +
+            `prompt ${promptChars} chars, reply ${replyChars} chars`
+        );
         if (!geminiResponse.ok) {
             console.warn(`[AI Proxy] Gemini returned ${geminiResponse.status} for model ${chosenModel}`);
         }
         return res.status(geminiResponse.status).json(data);
     } catch (err) {
-        console.error('[AI Proxy] Request failed:', err.message || err);
+        console.error(`[AI Proxy] Request failed after ${Date.now() - startedAt}ms:`, err.message || err);
         return res.status(502).json({ error: { message: `Could not reach the AI service: ${err.message || err}` } });
     }
+});
+
+/**
+ * Timing for the nutrition routes.
+ *
+ * Middleware rather than a line at each `res.json`, because between them these
+ * two handlers return from seven different places — early validation exits, the
+ * native-NLP branch, the free-search branch, the error catch — and one of them
+ * would inevitably be missed, which is precisely how a slow path stays
+ * invisible. `finish` fires on every one of them, including any added later.
+ *
+ * Nutrition verification is a large and completely unmeasured share of the
+ * ~10-minute meal generation: the AI calls have a 180s ceiling each and now log
+ * their duration, but this stage had no number attached to it at all.
+ *
+ * Registered BEFORE the handlers so it wraps them, and after the body parser so
+ * `ingredients` is populated — the count is what makes a slow line
+ * interpretable, since 40 ingredients legitimately takes longer than 6.
+ */
+app.use(['/api/nutrition/analyze', '/api/nutrition/estimate'], (req, res, next) => {
+    const startedAt = Date.now();
+    const count = Array.isArray(req.body && req.body.ingredients) ? req.body.ingredients.length : 0;
+
+    res.on('finish', () => {
+        console.log(`[Nutrition] ${req.path} ${res.statusCode} in ${Date.now() - startedAt}ms — ${count} ingredient(s)`);
+    });
+    // The app gives up at 180s; from here that is only ever a closed socket.
+    res.on('close', () => {
+        if (!res.writableEnded) {
+            console.warn(`[Nutrition] CLIENT ABORTED ${req.path} after ${Date.now() - startedAt}ms — ${count} ingredient(s)`);
+        }
+    });
+    next();
 });
 
 // Nutrition Analysis Endpoint
@@ -1233,10 +1401,12 @@ app.post('/api/nutrition/analyze', requireUser, async (req, res) => {
 
                     if (detailResponse.ok) {
                         const detailData = await detailResponse.json();
-                        servings = normalizeServings(detailData.food?.servings);
-                        if (servings.length > 0) {
-                            foodDetailCache.set(foodItem.food_id, servings);
-                            macros = resolveMacros(servings, parsedIng);
+                        if (!fatSecretError(detailData, `food.get ${foodItem.food_id}`)) {
+                            servings = normalizeServings(detailData.food?.servings);
+                            if (servings.length > 0) {
+                                foodDetailCache.set(foodItem.food_id, servings);
+                                macros = resolveMacros(servings, parsedIng);
+                            }
                         }
                     } else {
                         console.warn(`[Free Search] food.get failed for food_id ${foodItem.food_id}:`, detailResponse.status);
