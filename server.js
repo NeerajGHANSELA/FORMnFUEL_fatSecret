@@ -109,6 +109,55 @@ const foodSearchCache = new Map();
 const foodDetailCache = new Map();
 
 /**
+ * DID FATSECRET REFUSE US, or does it simply not know this food?
+ *
+ * ⚠️ THOSE TWO WERE THE SAME VALUE, AND IT COST 43 HOURS. `searchFoodItem`
+ * returned `null` for an IP-allowlist rejection, an expired token, an HTTP 5xx
+ * AND a genuine no-match alike — so an outage arrived at the pipeline as a run
+ * of foods that happen not to exist, and every meal quietly fell through to the
+ * AI estimator. Users still got a plan; it was built from guessed macros. The
+ * shallow /health said "ok" throughout, because credentials that EXIST are not
+ * credentials that WORK.
+ *
+ * A refusal is recorded here so three things can tell the truth: the log gets
+ * one unmistakable banner instead of twenty look-alike misses, /health reports
+ * `degraded` without needing ?deep=1, and the analyze response can tell the app
+ * its numbers are unverified.
+ *
+ * ⚠️ RECENCY, NOT A LATCH. A failure ten minutes old is not an outage — the IP
+ * may have been whitelisted since, the token refreshed, the 502 passed. Anything
+ * that latched until restart would keep reporting an outage that had ended, and
+ * an alert that cries wolf is one nobody reads on the day it matters.
+ */
+const SERVICE_FAILURE_STALE_MS = 10 * 60 * 1000;
+let lastServiceFailure = null;
+let serviceFailureCount = 0;
+
+function noteServiceFailure(code, message) {
+    const now = Date.now();
+    const isNewEpisode = !lastServiceFailure || now - lastServiceFailure.at > SERVICE_FAILURE_STALE_MS;
+    lastServiceFailure = { at: now, code: code ?? null, message: message ?? 'unknown' };
+    serviceFailureCount++;
+    // Once per episode. The per-call errors still log via fatSecretError; this is
+    // the line that says "this is not a missing food, this is the service".
+    if (isNewEpisode) {
+        console.error(
+            '\n========================================================\n' +
+            '[FatSecret] SERVICE FAILING — nutrition is now UNVERIFIED.\n' +
+            `  code    : ${code ?? 'n/a'}\n` +
+            `  message : ${message ?? 'unknown'}\n` +
+            '  Every lookup from here falls back to AI ESTIMATES.\n' +
+            '  code 21 = the caller IP is not on FatSecret\'s allowlist.\n' +
+            '========================================================\n'
+        );
+    }
+}
+
+/** True while a refusal is recent enough to still describe the current state. */
+const serviceIsDegraded = () =>
+    !!lastServiceFailure && Date.now() - lastServiceFailure.at < SERVICE_FAILURE_STALE_MS;
+
+/**
  * Retrieves a valid OAuth 2.0 access token from FatSecret.
  * Caches the token and automatically fetches a new one if it's expired or near expiration.
  */
@@ -913,13 +962,26 @@ async function searchFoodItem(searchExpression, token, foodCore) {
 
     if (!searchResponse.ok) {
         console.warn(`[Free Search] FatSecret search failed for "${searchExpression}":`, searchResponse.status);
+        // A 5xx is the service, not the food. See noteServiceFailure.
+        noteServiceFailure(`HTTP ${searchResponse.status}`, searchResponse.statusText || 'non-2xx from FatSecret');
         return null;
     }
 
     const searchData = await searchResponse.json();
     // Before reading results: a rejection arrives here as a 200 with an error
     // envelope, and would otherwise parse as "no matches". See fatSecretError.
-    if (fatSecretError(searchData, `foods.search "${searchExpression}"`)) return null;
+    //
+    // ⚠️ RECORDED AS A SERVICE FAILURE, not just logged. An error envelope is
+    // FatSecret declining to answer — an allowlist rejection, a bad token, a
+    // quota — and is categorically different from a search that ran and matched
+    // nothing (which returns 200 with an empty `foods.food`). Both still return
+    // null to the caller, because the caller's next move is the same either way;
+    // what changes is that the outage is now visible in /health and in the log.
+    const searchErr = fatSecretError(searchData, `foods.search "${searchExpression}"`);
+    if (searchErr) {
+        noteServiceFailure(searchErr.code, searchErr.message);
+        return null;
+    }
     const rawResults = searchData.foods?.food;
     const results = Array.isArray(rawResults) ? rawResults : (rawResults ? [rawResults] : []);
     const usable = results.filter(f => f && f.food_id);
@@ -958,14 +1020,33 @@ const DEEP_PROBE_TTL_MS = 60_000;
  * answer rather than an inference.
  */
 app.get('/health', async (req, res) => {
+    /**
+     * ⚠️ THE SHALLOW ANSWER NOW REFLECTS REAL TRAFFIC, which is the whole point.
+     * It used to be hardcoded "ok" and said so for 46 hours through one outage
+     * and 43 through another, because it only ever checked that credentials
+     * EXISTED. It now reports `degraded` whenever a real lookup was refused in
+     * the last ten minutes — so a plain uptime monitor watching this endpoint
+     * catches an outage without needing ?deep=1 or a FatSecret round trip.
+     *
+     * The deep probe is still the stronger signal: this can only report failures
+     * that TRAFFIC discovered, so an idle server with a broken allowlist still
+     * looks fine here until someone generates a plan. Use ?deep=1 to ask
+     * directly; use this to notice.
+     */
+    const degraded = serviceIsDegraded();
     const body = {
-        status: "ok",
+        status: degraded ? "degraded" : "ok",
         uptime: process.uptime(),
         nativeNlpMode: USE_NATIVE_NLP,
         config: {
             hasClientId: !!process.env.FATSECRET_CLIENT_ID,
             hasClientSecret: !!process.env.FATSECRET_CLIENT_SECRET
         },
+        // Null when nothing has been refused recently. `count` is for the life of
+        // the process, so it keeps counting across episodes.
+        fatSecretLastFailure: lastServiceFailure
+            ? { ...lastServiceFailure, ageMs: Date.now() - lastServiceFailure.at, count: serviceFailureCount }
+            : null,
         foodCache: {
             searchEntries: foodSearchCache.size,
             detailEntries: foodDetailCache.size
@@ -974,8 +1055,16 @@ app.get('/health', async (req, res) => {
 
     if (req.query.deep !== '1') return res.json(body);
 
+    // ⚠️ `&& !degraded`, on both deep paths. The probe is a SAMPLE and this one is
+    // up to DEEP_PROBE_TTL_MS old — so a probe that passed minutes ago must not
+    // overwrite a refusal that real traffic hit since. Either signal saying
+    // "degraded" means degraded; only both agreeing means ok.
     if (lastDeepProbe && Date.now() - lastDeepProbe.at < DEEP_PROBE_TTL_MS) {
-        return res.json({ ...body, status: lastDeepProbe.result.ok ? 'ok' : 'degraded', fatSecret: { ...lastDeepProbe.result, cached: true } });
+        return res.json({
+            ...body,
+            status: lastDeepProbe.result.ok && !degraded ? 'ok' : 'degraded',
+            fatSecret: { ...lastDeepProbe.result, cached: true },
+        });
     }
 
     let result;
@@ -1005,7 +1094,10 @@ app.get('/health', async (req, res) => {
     }
 
     lastDeepProbe = { at: Date.now(), result };
-    return res.json({ ...body, status: result.ok ? 'ok' : 'degraded', fatSecret: result });
+    // A fresh probe can clear its own doubt but not traffic's — see above. If the
+    // probe passes while lookups are being refused, something is wrong that a
+    // single "chicken breast" query does not reach, and "ok" would be a lie.
+    return res.json({ ...body, status: result.ok && !degraded ? 'ok' : 'degraded', fatSecret: result });
 });
 
 // ---------------------------------------------------------------------------
