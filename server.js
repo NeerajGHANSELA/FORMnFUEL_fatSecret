@@ -945,29 +945,110 @@ function fatSecretError(data, context) {
     return err;
 }
 
-async function searchFoodItem(searchExpression, token, foodCore) {
-    const searchResponse = await fetchWithRetry('https://platform.fatsecret.com/rest/server.api', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: new URLSearchParams({
-            method: 'foods.search',
-            search_expression: searchExpression,
-            format: 'json',
-            max_results: '5'
-        })
-    });
+const FATSECRET_URL = 'https://platform.fatsecret.com/rest/server.api';
 
-    if (!searchResponse.ok) {
-        console.warn(`[Free Search] FatSecret search failed for "${searchExpression}":`, searchResponse.status);
-        // A 5xx is the service, not the food. See noteServiceFailure.
-        noteServiceFailure(`HTTP ${searchResponse.status}`, searchResponse.statusText || 'non-2xx from FatSecret');
-        return null;
+/**
+ * FatSecret error codes worth a SECOND ROLL OF THE DICE.
+ *
+ * 21 is "Invalid IP address detected". It reads like a permanent configuration
+ * error and is not one here: this service egresses through a POOL of Railway
+ * static IPs, one picked per connection, and an allowlist can be live for some
+ * of them and not others. Observed exactly that — two of three accepted while
+ * `152.55.184.241` was refused for hours, so roughly a third of all lookups
+ * failed on nothing but which address they happened to leave from.
+ *
+ * ⚠️ ONLY codes whose outcome can CHANGE between identical requests belong
+ * here. A bad food id or a malformed query will fail the same way forever, and
+ * retrying those just multiplies latency by three on the calls least likely to
+ * benefit.
+ */
+const RETRYABLE_FATSECRET_CODES = new Set([21]);
+const FATSECRET_RETRIES = 2;
+
+/**
+ * One FatSecret POST, retried when FATSECRET refuses rather than when HTTP does.
+ *
+ * ⚠️ THE EXISTING fetchWithRetry CANNOT DO THIS, and that is the whole point of
+ * this wrapper. It retries on `429` or `5xx` — but a refusal arrives as a
+ * perfectly good **HTTP 200** carrying an error envelope, so `response.ok` is
+ * true and it returns first time, every time. The failure this exists for is
+ * invisible at the layer that decides to retry.
+ *
+ * ⚠️ `Connection: close` IS THE LOAD-BEARING HEADER, not politeness. Node keeps
+ * sockets alive and reuses them, and a retry down the SAME socket leaves from
+ * the SAME egress IP — which is the one that just refused us. Reusing the
+ * connection would make this wrapper pure latency. Asking the server to close
+ * means the next attempt dials again and gets another draw from the pool.
+ *
+ * ⚠️ AND IT IS A DRAW, NOT A ROTATION. Railway assigns an address per
+ * connection at random; a retry can land on the bad one again. With three IPs
+ * and one refusing, a single attempt fails ~33% of the time, two ~11%, three
+ * ~4%. This makes the failure rare, never impossible — callers must still cope
+ * with a null.
+ *
+ * The rescue log below is the only honest evidence that any of this works: if
+ * `Connection: close` is ignored and the socket is reused, every retry fails
+ * identically and NO rescue line is ever printed. Absence of that line after a
+ * spell of code 21s means this approach needs replacing (raw node:https with
+ * `agent: false`), not that the outage is over.
+ */
+async function fatSecretPost(params, token, context) {
+    let last = { ok: false, status: 0, data: null };
+
+    for (let attempt = 0; attempt <= FATSECRET_RETRIES; attempt++) {
+        const response = await fetchWithRetry(FATSECRET_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Connection': 'close',
+            },
+            body: new URLSearchParams(params),
+        });
+
+        if (!response.ok) return { ok: false, status: response.status, data: null };
+
+        const data = await response.json().catch(() => null);
+        const code = Number(data?.error?.code);
+        const retryable = Number.isFinite(code) && RETRYABLE_FATSECRET_CODES.has(code);
+
+        if (!retryable) {
+            if (attempt > 0 && !data?.error) {
+                console.warn(
+                    `[FatSecret] ${context} — retry ${attempt}/${FATSECRET_RETRIES} SUCCEEDED. ` +
+                    `The earlier attempt(s) left from a refused egress IP; this one did not.`
+                );
+            }
+            return { ok: true, status: response.status, data };
+        }
+
+        last = { ok: true, status: response.status, data };
+        if (attempt < FATSECRET_RETRIES) {
+            console.warn(
+                `[FatSecret] ${context} refused with code ${code} on attempt ${attempt + 1}/${FATSECRET_RETRIES + 1} ` +
+                `— redialling on a fresh connection for a different egress IP.`
+            );
+        }
     }
 
-    const searchData = await searchResponse.json();
+    // Every attempt refused. The caller reports it through fatSecretError as before.
+    return last;
+}
+
+async function searchFoodItem(searchExpression, token, foodCore) {
+    const { ok, status, data: searchData } = await fatSecretPost({
+        method: 'foods.search',
+        search_expression: searchExpression,
+        format: 'json',
+        max_results: '5'
+    }, token, `foods.search "${searchExpression}"`);
+
+    if (!ok) {
+        console.warn(`[Free Search] FatSecret search failed for "${searchExpression}":`, status);
+        // A 5xx is the service, not the food. See noteServiceFailure.
+        noteServiceFailure(`HTTP ${status}`, 'non-2xx from FatSecret');
+        return null;
+    }
     // Before reading results: a rejection arrives here as a 200 with an error
     // envelope, and would otherwise parse as "no matches". See fatSecretError.
     //
@@ -1086,10 +1167,20 @@ app.get('/health', async (req, res) => {
         const data = await probe.json().catch(() => ({}));
         const elapsedMs = Date.now() - started;
         const err = fatSecretError(data, 'health probe');
+        // ⚠️ RECORDED, not just reported. A probe that FatSecret refuses is
+        // evidence of the same outage a user's lookup would hit — and without
+        // this the two halves of /health contradict each other: the deep answer
+        // says the probe failed while the shallow one says "ok", because the
+        // traffic-based window quietly expired. Observed live: a refusal at
+        // 19:09 and `status: "ok"` at 19:14, five minutes apart.
+        if (err) noteServiceFailure(err.code, err.message);
         result = err
             ? { ok: false, code: err.code, message: err.message, elapsedMs }
             : { ok: !!data?.foods?.food, matched: data?.foods?.food?.food_name ?? null, elapsedMs };
     } catch (e) {
+        // A probe that could not even be attempted (token fetch, DNS, timeout)
+        // is also the service being unreachable, not a quiet nothing.
+        noteServiceFailure('probe-exception', e.message || String(e));
         result = { ok: false, message: e.message || String(e) };
     }
 
@@ -1478,21 +1569,17 @@ app.post('/api/nutrition/analyze', requireUser, async (req, res) => {
                 macros = resolveMacros(servings, parsedIng);
             } else {
                 try {
-                    const detailResponse = await fetchWithRetry('https://platform.fatsecret.com/rest/server.api', {
-                        method: 'POST',
-                        headers: {
-                            'Authorization': `Bearer ${token}`,
-                            'Content-Type': 'application/x-www-form-urlencoded'
-                        },
-                        body: new URLSearchParams({
-                            method: 'food.get',
-                            food_id: foodItem.food_id,
-                            format: 'json'
-                        })
-                    });
+                    // Same retry-on-refusal path as the search above: a food.get
+                    // that leaves from the refused egress IP is not a missing
+                    // food either. See fatSecretPost.
+                    const detail = await fatSecretPost({
+                        method: 'food.get',
+                        food_id: foodItem.food_id,
+                        format: 'json'
+                    }, token, `food.get ${foodItem.food_id}`);
 
-                    if (detailResponse.ok) {
-                        const detailData = await detailResponse.json();
+                    if (detail.ok) {
+                        const detailData = detail.data;
                         if (!fatSecretError(detailData, `food.get ${foodItem.food_id}`)) {
                             servings = normalizeServings(detailData.food?.servings);
                             if (servings.length > 0) {
@@ -1501,7 +1588,7 @@ app.post('/api/nutrition/analyze', requireUser, async (req, res) => {
                             }
                         }
                     } else {
-                        console.warn(`[Free Search] food.get failed for food_id ${foodItem.food_id}:`, detailResponse.status);
+                        console.warn(`[Free Search] food.get failed for food_id ${foodItem.food_id}:`, detail.status);
                     }
                 } catch (detailErr) {
                     console.warn(`[Free Search] food.get error for food_id ${foodItem.food_id}:`, detailErr.message);
