@@ -222,20 +222,29 @@ async function getFatSecretToken() {
 }
 
 // Matches the trailing "(150g, max 220g)" annotation the AI is prompted to append to every
-// ingredient - its own gram estimate for the stated quantity, plus a realistic per-meal max.
-// Stripped out before any unit/food parsing so it never pollutes the FatSecret search query
-// or the unit-matching logic, and pulled out separately as aiGrams/aiMax so resolveMacros can
-// anchor its gram-normalization and plausibility checks on the AI's own number instead of the
-// generic CONVERSIONS table guess.
+// ingredient. Stripped out before any unit/food parsing so it never pollutes the FatSecret
+// search query or the unit-matching logic, and its gram figure pulled out as aiGrams so
+// resolveMacros can anchor its gram-normalization on the AI's own number for this exact
+// ingredient occurrence instead of the generic CONVERSIONS table guess.
+//
+// ⚠️ ONLY the first number is used. The annotation's "max" was parsed into an `aiMax` that
+// nothing ever read - and the comment here used to claim it fed "plausibility checks", so the
+// file asserted a portion guard that did not exist. What does exist is isPlausible below: a
+// DENSITY ceiling (10 kcal/g), which catches a wrong serving match and not an absurd quantity.
+// A right-density, wrong-quantity ingredient - "3 cups rice" meaning three quarters of one -
+// is still unguarded. If that is ever worth closing, close it with a bound derived in code:
+// asking the model for its own ceiling is the same trap as asking it for any other number it
+// has no way to check.
+//
+// The regex keeps both capture groups because it has to match the whole shape to strip it.
 const GRAMS_ANNOTATION_REGEX = /\(\s*([\d.]+)\s*g\s*,\s*max\s*([\d.]+)\s*g\s*\)\s*$/i;
 
 function stripGramsAnnotation(str) {
     const match = str.match(GRAMS_ANNOTATION_REGEX);
-    if (!match) return { clean: str, aiGrams: null, aiMax: null };
+    if (!match) return { clean: str, aiGrams: null };
     return {
         clean: str.replace(GRAMS_ANNOTATION_REGEX, '').trim(),
-        aiGrams: parseFloat(match[1]),
-        aiMax: parseFloat(match[2])
+        aiGrams: parseFloat(match[1])
     };
 }
 
@@ -243,7 +252,7 @@ function stripGramsAnnotation(str) {
  * Helper to parse an ingredient string into a structured object containing quantity, unit, and food item name.
  */
 function parseIngredient(str) {
-    const { clean: withoutAnnotation, aiGrams, aiMax } = stripGramsAnnotation(str.trim());
+    const { clean: withoutAnnotation, aiGrams } = stripGramsAnnotation(str.trim());
     const clean = withoutAnnotation.toLowerCase()
         .replace(/\bof\b/g, '')
         .replace(/\s+/g, ' ');
@@ -329,8 +338,7 @@ function parseIngredient(str) {
         food: food || rest,
         // Fallback-only search term; null when stripping changed nothing (or ate everything).
         foodSimplified: simplified && simplified !== food ? simplified : null,
-        aiGrams,
-        aiMax
+        aiGrams
     };
 }
 
