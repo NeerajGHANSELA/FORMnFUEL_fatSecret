@@ -65,6 +65,171 @@ if (!supabaseAuth) {
  * than serving unauthenticated traffic — the failure mode of an auth check that
  * falls back to "allow" is an open, billable endpoint that looks fine.
  */
+/**
+ * Per-user rate limiting for the AI endpoint.
+ *
+ * The Gemini key is server-side and every caller is a verified account, so the
+ * remaining exposure is a REAL account spending our money faster than a person
+ * could — a script in a loop, or a token lifted out of the app bundle. Auth
+ * answers "who", never "how much".
+ *
+ * ⚠️ THIS IS AN ABUSE CONTROL, NOT A QUOTA. The limits are set where no human
+ * reaches them and a loop dies immediately. A commercial "you get N plans a
+ * month" is a different feature with different failure handling: it needs a
+ * visible balance and a subscription to reset against, and telling a user no
+ * without either is how a paying customer decides the app is broken.
+ *
+ * ⚠️ THE BUCKET COUNTS THE USER'S ACTION, NOT THE CALLS IT COSTS. One diet
+ * generation is a draft plus up to three day-repair rounds plus an ingredient
+ * repair plus an instructions pass batched ten meals at a time — four to nine
+ * requests, depending entirely on how well the model did. Counting all of them
+ * against "5 diet plans an hour" would have made the allowance depend on the
+ * model's luck and punished the user for its failures. Only the label the user
+ * actually initiated counts against the small buckets; the rest fall to
+ * MACHINERY, which is bounded transitively because none of it can run outside
+ * an action that is already capped.
+ */
+
+/**
+ * Which allowance each operation label spends from.
+ *
+ * ⚠️ THE LABEL IS CLIENT-SUPPLIED AND THEREFORE A HINT, and it is safe here for
+ * one reason only: the worst a liar achieves is spending their OWN generation
+ * allowance on swaps. It must never be trusted for anything that costs us
+ * money — pricing belongs on measured token usage, which the client cannot
+ * forge. See the app's geminiProxy call sites for where these are set.
+ */
+const AI_BUCKETS = {
+    workout_generate: 'workout_generate',
+    diet_generate: 'diet_generate',
+    workout_exercise_swap: 'workout_swap',
+    diet_meal_swap: 'diet_swap',
+    diet_meal_swap_named: 'diet_swap',
+};
+
+/**
+ * Requests per hour, per user, per bucket.
+ *
+ * MACHINERY's floor is arithmetic, not taste: at these limits a user may
+ * legitimately drive 5x9 + 5x2 + 5x1 + 5x1 = 65 machinery calls in an hour
+ * without doing anything unusual. Set it below that and it silently becomes the
+ * real limit — a user still inside their five generations gets one that dies
+ * mid-repair, with no way to understand why. 100 leaves room for the paths no
+ * bucket caps: prep instructions while browsing a week of meals, and tapping
+ * through the manual swap sheet.
+ */
+const AI_LIMITS = {
+    workout_generate: 5,
+    diet_generate: 5,
+    workout_swap: 5,
+    diet_swap: 5,
+    machinery: 100,
+};
+
+const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * `${userId}:${bucket}` -> { count, resetAt }.
+ *
+ * ⚠️ IN MEMORY, AND THAT IS A DELIBERATE STARTING POINT RATHER THAN AN
+ * OVERSIGHT. A restart clears every counter, so a deploy hands everyone a fresh
+ * allowance. At this scale that is a rounding error against the cost of running
+ * Redis, and the failure direction is the safe one — a lost counter is a user
+ * who gets five more generations, not a user locked out of an app they paid
+ * for. It stops being acceptable the moment this runs on more than one
+ * instance, because each would then keep its own third of the truth.
+ */
+const aiHits = new Map();
+
+/**
+ * Sweeps expired windows so the Map cannot grow forever.
+ *
+ * Without this, one entry per user per bucket accumulates for the process's
+ * lifetime — slow, but unbounded, and the kind of leak that only shows up
+ * months later as memory pressure on a box nobody is watching. `unref()` so a
+ * pending sweep never holds the process open on shutdown.
+ */
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, hit] of aiHits) {
+        if (hit.resetAt <= now) aiHits.delete(key);
+    }
+}, HOUR_MS).unref();
+
+/**
+ * Counts one request and reports whether it may proceed.
+ *
+ * The window is anchored on the FIRST request in it, not on the clock hour, so
+ * every user's hour starts when they start. The known weakness is the boundary
+ * — five at 10:58 and five at 11:04 is ten in six minutes — which needs
+ * deliberate timing, caps out at roughly double for one burst, and is what a
+ * sliding window would fix if the logs ever show someone riding it.
+ */
+const takeAiToken = (userId, bucket) => {
+    const limit = AI_LIMITS[bucket];
+    // An unknown bucket must never fail open into an uncounted free pass.
+    if (!limit) return { ok: true, remaining: Infinity, retryAfterSec: 0 };
+
+    const key = `${userId}:${bucket}`;
+    const now = Date.now();
+    const hit = aiHits.get(key);
+
+    if (!hit || hit.resetAt <= now) {
+        aiHits.set(key, { count: 1, resetAt: now + HOUR_MS });
+        return { ok: true, remaining: limit - 1, retryAfterSec: 0 };
+    }
+
+    if (hit.count >= limit) {
+        return {
+            ok: false,
+            remaining: 0,
+            // Rounded UP: a client that retries on the second the window
+            // expires races it and gets a second refusal.
+            retryAfterSec: Math.max(1, Math.ceil((hit.resetAt - now) / 1000)),
+        };
+    }
+
+    hit.count += 1;
+    return { ok: true, remaining: limit - hit.count, retryAfterSec: 0 };
+};
+
+/**
+ * The middleware. Runs AFTER requireUser, which is what puts `req.userId` here.
+ *
+ * ⚠️ AN UNRECOGNISED OR MISSING LABEL FALLS TO MACHINERY rather than being
+ * refused. Builds already in testers' hands send no `operation` at all, and
+ * refusing them would break the app on every phone that has not taken the
+ * update — a limit nobody asked for, applied to people who cannot act on it.
+ * Machinery is generous enough that an old build behaves normally and still
+ * cannot loop.
+ */
+const rateLimitAi = (req, res, next) => {
+    const label = typeof req.body?.operation === 'string' ? req.body.operation : null;
+    const bucket = (label && AI_BUCKETS[label]) || 'machinery';
+
+    const { ok, remaining, retryAfterSec } = takeAiToken(req.userId, bucket);
+
+    // Sent on every response, not only refusals: a client that can see its own
+    // headroom can back off before it is told to.
+    res.setHeader('X-RateLimit-Bucket', bucket);
+    res.setHeader('X-RateLimit-Remaining', String(remaining));
+
+    if (ok) return next();
+
+    console.warn(`[ratelimit] ${req.userId} exhausted ${bucket} (label=${label ?? 'none'})`);
+    res.setHeader('Retry-After', String(retryAfterSec));
+    return res.status(429).json({
+        error: {
+            // `code` so the app can branch on the reason without parsing prose,
+            // and `bucket` so it can pick the right banner copy.
+            code: 'rate_limited',
+            bucket,
+            retryAfterSec,
+            message: 'Too many requests. Try again shortly.',
+        },
+    });
+};
+
 const requireUser = async (req, res, next) => {
     if (!supabaseAuth) {
         return res.status(503).json({ error: { message: 'Server auth is not configured.' } });
@@ -1214,7 +1379,7 @@ app.get('/health', async (req, res) => {
 // Body-size note: the limit for this route is set on the GLOBAL express.json()
 // at the top of this file, not here — see the comment there for why a
 // route-level limit doesn't work.
-app.post('/api/ai/generate', requireUser, async (req, res) => {
+app.post('/api/ai/generate', requireUser, rateLimitAi, async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured on the proxy server.' } });
