@@ -343,6 +343,72 @@ const requireSubscription = async (req, res, next) => {
     });
 };
 
+/**
+ * Who is making the call, readable from anywhere beneath the request.
+ *
+ * ⚠️ `AsyncLocalStorage`, NOT A MODULE VARIABLE. `pickBestFoodMatchWithAI` and
+ * `estimateIngredientMacrosWithAI` are plain functions several layers below the
+ * handler and have no `req` — but their ~120 calls per plan are most of the
+ * spend, so usage that cannot attribute them is not worth recording. A
+ * module-level "current user" would be wrong the moment two requests overlap;
+ * this is per-async-context and cannot interleave. Threading a userId through
+ * six signatures was the alternative.
+ */
+const { AsyncLocalStorage } = require('node:async_hooks');
+const callerContext = new AsyncLocalStorage();
+
+/**
+ * Usage rows waiting to be written.
+ *
+ * ⚠️ BUFFERED, BECAUSE ONE PLAN IS ~120 ROWS. Inserting each as it happens is
+ * 120 round trips from EU West to Supabase per generation, on the critical path
+ * of a flow already measured in minutes. Flushed on a timer or a size cap,
+ * whichever comes first.
+ *
+ * ⚠️ AND NEVER AWAITED BY A HANDLER. Measurement must not be able to slow down,
+ * fail, or break a generation — a dropped buffer costs a row of analytics, a
+ * blocked insert costs a user their plan. Losses on crash are accepted.
+ */
+const usageBuffer = [];
+const USAGE_FLUSH_ROWS = 50;
+const USAGE_FLUSH_MS = 5000;
+let usageFlushTimer = null;
+
+const flushUsage = async () => {
+    if (usageFlushTimer) { clearTimeout(usageFlushTimer); usageFlushTimer = null; }
+    if (usageBuffer.length === 0 || !SUPABASE_URL || !SUPABASE_ANON_KEY) return;
+
+    const batch = usageBuffer.splice(0, usageBuffer.length);
+    /* Written AS THE USER, under RLS — the proxy holds their JWT already, so no
+       service-role key has to exist here. Grouped by token because a batch may
+       span callers, and PostgREST takes an array in one request. */
+    const byToken = new Map();
+    for (const { token, row } of batch) {
+        if (!token) continue;
+        if (!byToken.has(token)) byToken.set(token, []);
+        byToken.get(token).push(row);
+    }
+    for (const [token, rows] of byToken) {
+        try {
+            const r = await fetch(`${SUPABASE_URL}/rest/v1/ai_usage`, {
+                method: 'POST',
+                headers: {
+                    apikey: SUPABASE_ANON_KEY,
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                    Prefer: 'return=minimal',
+                },
+                body: JSON.stringify(rows),
+            });
+            if (!r.ok) {
+                console.warn(`[AI Usage] insert returned ${r.status} for ${rows.length} row(s)`);
+            }
+        } catch (err) {
+            console.warn('[AI Usage] insert failed:', err?.message || err);
+        }
+    }
+};
+
 const requireUser = async (req, res, next) => {
     if (!supabaseAuth) {
         return res.status(503).json({ error: { message: 'Server auth is not configured.' } });
@@ -361,7 +427,9 @@ const requireUser = async (req, res, next) => {
         }
         // Downstream handlers and logs can attribute spend to a real account.
         req.userId = data.user.id;
-        return next();
+        /* The token travels with the id: usage rows are written as this user so
+           RLS applies, which is what keeps a service-role key off this box. */
+        return callerContext.run({ userId: data.user.id, token }, () => next());
     } catch (err) {
         // A network failure talking to Supabase is NOT permission to proceed.
         console.warn('[auth] Token verification failed:', err?.message || err);
@@ -1118,6 +1186,42 @@ const logUsage = (op, modelName, data, elapsedMs) => {
         `in=${u.promptTokenCount ?? '?'} out=${u.candidatesTokenCount ?? '?'} ` +
         `think=${think} total=${u.totalTokenCount ?? '?'} ms=${elapsedMs}`
     );
+
+    /**
+     * The same numbers, somewhere they survive.
+     *
+     * ⚠️ THE LOG LINE STAYS. It is what you read while a generation is running;
+     * the table is what you query a month later. Retention is the difference:
+     * Railway keeps 7 days and drops lines under exactly the burst one plan
+     * produces.
+     *
+     * ⚠️ NO ROW WITHOUT A CALLER. An unattributed row cannot answer "what does
+     * this user cost", which is the only question worth storing it for.
+     */
+    const caller = callerContext.getStore();
+    if (!caller?.userId || !caller?.token) return;
+
+    usageBuffer.push({
+        token: caller.token,
+        row: {
+            user_id: caller.userId,
+            operation: op,
+            model: modelName,
+            prompt_tokens: u.promptTokenCount ?? 0,
+            output_tokens: u.candidatesTokenCount ?? 0,
+            thinking_tokens: think,
+            total_tokens: u.totalTokenCount ?? 0,
+            elapsed_ms: elapsedMs,
+        },
+    });
+
+    if (usageBuffer.length >= USAGE_FLUSH_ROWS) {
+        void flushUsage();
+    } else if (!usageFlushTimer) {
+        usageFlushTimer = setTimeout(() => { void flushUsage(); }, USAGE_FLUSH_MS);
+        /* Must not keep the process alive on its own account. */
+        if (usageFlushTimer.unref) usageFlushTimer.unref();
+    }
 };
 
 const MATCH_MODEL = process.env.GEMINI_MATCH_MODEL || 'gemini-3.5-flash-lite';
