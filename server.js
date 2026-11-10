@@ -1227,6 +1227,44 @@ const logUsage = (op, modelName, data, elapsedMs) => {
 const MATCH_MODEL = process.env.GEMINI_MATCH_MODEL || 'gemini-3.5-flash-lite';
 const ESTIMATE_MODEL = process.env.GEMINI_ESTIMATE_MODEL || 'gemini-3.8-flash';
 
+/**
+ * How much reasoning each per-ingredient call may spend.
+ *
+ * ⚠️ A CEILING, NOT A SPEND. The model uses what the task needs and stops; this
+ * bounds the worst case. So the numbers are sized by "what could this task
+ * plausibly need" multiplied by how many times it runs, not by how clever we
+ * would like the answer to be.
+ *
+ * ⚠️ AND SETTING THEM AT ALL IS THE POINT, because 3.8 THINKS BY DEFAULT.
+ * Measured 2026-11-09: a `workout_generate` call that was never given a
+ * `thinkingConfig` still reported 3,156 thinking tokens against 2,892 of
+ * output — reasoning was more than half the billed output, uninstructed.
+ * Leaving these unset does not mean "no thinking", it means "unbounded
+ * thinking, ~120 times per plan". Thinking tokens bill as output.
+ *
+ * MATCH gets least: choosing one of five candidate foods is discrimination,
+ * and it runs ~120 times. ESTIMATE gets more: its numbers go straight into the
+ * plan with nothing downstream to check them, and it only runs for foods
+ * FatSecret could not price at all.
+ */
+const MATCH_THINKING_BUDGET = Number(process.env.GEMINI_MATCH_THINKING ?? 512);
+const ESTIMATE_THINKING_BUDGET = Number(process.env.GEMINI_ESTIMATE_THINKING ?? 1024);
+
+/**
+ * What a call gets when the app asks for no thinking budget of its own.
+ *
+ * ⚠️ WITHOUT THIS, "NO thinkingConfig" MEANS UNBOUNDED, NOT NONE. 3.8 thinks by
+ * default — measured 2026-11-09, a `workout_generate` call carrying no
+ * thinking config at all still spent 3,156 thinking tokens against 2,892 of
+ * output. Fifteen distinct operations reach this endpoint and exactly one
+ * (`diet_generate`) sets a budget, so everything else was running uncapped.
+ *
+ * A default here rather than a budget at fifteen call sites: one place to
+ * change, nothing to forget on the sixteenth, and an app that does set one
+ * still wins outright.
+ */
+const DEFAULT_THINKING_BUDGET = Number(process.env.GEMINI_DEFAULT_THINKING ?? 1024);
+
 // Asks Gemini to judge, from the REAL FatSecret candidates for one search,
 // which one (if any) is genuinely the same food as the ingredient - this is
 // the primary match-acceptance check, replacing word-overlap guessing with
@@ -1270,7 +1308,10 @@ Respond with ONLY the number of the correct entry, or 0 if none are correct. No 
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: { temperature: 0 },
+                    generationConfig: {
+                        temperature: 0,
+                        thinkingConfig: { thinkingBudget: MATCH_THINKING_BUDGET, includeThoughts: false },
+                    },
                 }),
                 signal: controller.signal,
             }
@@ -1327,7 +1368,10 @@ Using standard nutrition data for this food, respond with ONLY the protein, carb
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: { temperature: 0 },
+                    generationConfig: {
+                        temperature: 0,
+                        thinkingConfig: { thinkingBudget: ESTIMATE_THINKING_BUDGET, includeThoughts: false },
+                    },
                 }),
                 signal: controller.signal,
             }
@@ -1745,6 +1789,14 @@ app.post('/api/ai/generate', requireUser, requireSubscription, rateLimitAi, asyn
      * A second, shorter timeout here would just truncate long (but healthy)
      * generations — a flash draft legitimately runs ~70s.
      */
+    /* The app's own thinkingConfig outranks the default — see
+       DEFAULT_THINKING_BUDGET. Built once, outside the retry, so the fallback
+       attempt sends exactly what the primary did. */
+    const effectiveConfig = { ...(generationConfig || {}) };
+    if (!effectiveConfig.thinkingConfig) {
+        effectiveConfig.thinkingConfig = { thinkingBudget: DEFAULT_THINKING_BUDGET, includeThoughts: false };
+    }
+
     const callModel = async (modelName) => {
         const attemptStart = Date.now();
         const geminiResponse = await fetch(
@@ -1752,7 +1804,7 @@ app.post('/api/ai/generate', requireUser, requireSubscription, rateLimitAi, asyn
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ contents, generationConfig }),
+                body: JSON.stringify({ contents, generationConfig: effectiveConfig }),
             }
         );
         const data = await geminiResponse.json().catch(() => ({}));
