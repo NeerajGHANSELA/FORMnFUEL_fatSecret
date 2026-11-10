@@ -111,19 +111,36 @@ const AI_BUCKETS = {
  * Requests per hour, per user, per bucket.
  *
  * MACHINERY's floor is arithmetic, not taste: at these limits a user may
- * legitimately drive 5x9 + 5x2 + 5x1 + 5x1 = 65 machinery calls in an hour
+ * legitimately drive 5x9 + 5x2 + 15x1 + 15x1 = 85 machinery calls in an hour
  * without doing anything unusual. Set it below that and it silently becomes the
  * real limit — a user still inside their five generations gets one that dies
- * mid-repair, with no way to understand why. 100 leaves room for the paths no
+ * mid-repair, with no way to understand why. 120 leaves room for the paths no
  * bucket caps: prep instructions while browsing a week of meals, and tapping
  * through the manual swap sheet.
+ *
+ * ⚠️ SWAPS WENT 5 -> 15, AND MACHINERY HAD TO MOVE WITH THEM. Five was set
+ * against no particular workflow and turned out to be below the ordinary one:
+ * reviewing a freshly generated five-or-six exercise plan and replacing three
+ * or four of them is what the review screen invites, and a second look an hour
+ * later exhausted it. A refused swap then surfaced as "the request takes too
+ * long", so the limit read as a bug.
+ *
+ * The raise is affordable because a swap is not a generation. Measured on the
+ * real prompts: a swap sends ~700 tokens and a plan build ~3,800, so 15 swaps
+ * is roughly two builds' worth against an allowance of five builds an hour.
+ *
+ * ⚠️ THE FLOOR ABOVE MOVED FROM 65 TO 85, which is why machinery is 120 and not
+ * still 100. Leaving it at 100 would have left 15 of slack where there was 35,
+ * and the first thing to break would have been a repair round inside a
+ * generation the user had every right to — exactly the silent failure this
+ * paragraph exists to prevent.
  */
 const AI_LIMITS = {
     workout_generate: 5,
     diet_generate: 5,
-    workout_swap: 5,
-    diet_swap: 5,
-    machinery: 100,
+    workout_swap: 15,
+    diet_swap: 15,
+    machinery: 120,
 };
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -226,6 +243,102 @@ const rateLimitAi = (req, res, next) => {
             bucket,
             retryAfterSec,
             message: 'Too many requests. Try again shortly.',
+        },
+    });
+};
+
+/**
+ * How long an entitlement answer is trusted before we ask again.
+ *
+ * ⚠️ SHORT ON PURPOSE. This cache is the window in which a cancelled or expired
+ * subscriber can still spend. Sixty seconds costs at most one free generation
+ * and saves a database round trip on every AI call; an hour would be a free
+ * afternoon. It is deliberately not tied to `expires_at`, which can be days
+ * away and tells you nothing about a refund that happened ten seconds ago.
+ */
+const ENTITLEMENT_TTL_MS = 60_000;
+const entitlementCache = new Map();
+
+/**
+ * Is this user entitled to spend our money?
+ *
+ * ⚠️ THIS IS THE ONLY REAL GATE, AND THE CLIENT'S CHECK IS NOT ONE. The app
+ * hides buttons it thinks are unavailable, which is UX — a patched binary shows
+ * them anyway. What stops a non-subscriber generating a plan is this function
+ * refusing before the request reaches a paid API. Everything behind the paywall
+ * costs tokens per call, so the gate belongs where the tokens are spent.
+ *
+ * ⚠️ AND IT READS WITH THE CALLER'S OWN TOKEN, NOT A SERVICE ROLE. The RLS
+ * policy already lets a user read their own subscription, so no extra privilege
+ * is needed — and a service-role key sitting in this process would bypass every
+ * policy in the database if the proxy were ever compromised. Least privilege
+ * costs nothing here.
+ */
+const isEntitled = async (userId, token) => {
+    const cached = entitlementCache.get(userId);
+    if (cached && cached.at > Date.now() - ENTITLEMENT_TTL_MS) return cached.ok;
+
+    const scoped = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: { headers: { Authorization: `Bearer ${token}` } },
+    });
+
+    const { data, error } = await scoped
+        .from('subscriptions')
+        .select('status, expires_at')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+    // ⚠️ AN ERROR IS NOT A YES. A failed read looks exactly like a missing row,
+    // and treating "cannot tell" as entitled would hand the paid tier to anyone
+    // who can make a query fail. Not cached either — the next call retries.
+    if (error) {
+        console.warn('[entitlement] read failed:', error.message);
+        return false;
+    }
+
+    const ENTITLED = ['active', 'trialing', 'grace', 'cancelled'];
+    const ok = !!data
+        && ENTITLED.includes(data.status)
+        && !!data.expires_at
+        && new Date(data.expires_at).getTime() > Date.now();
+
+    entitlementCache.set(userId, { ok, at: Date.now() });
+    return ok;
+};
+
+/**
+ * The middleware. Runs AFTER requireUser, which supplies `req.userId`.
+ *
+ * ⚠️ IT GUARDS THE SHORTCUTS, NEVER THE RECORD. Nutrition analyse/estimate
+ * turn "what I ate" into macros, and a free user can still type the name,
+ * calories and macros in by hand — so the paid feature is the convenience, not
+ * the ability to log food. Nothing that WRITES a user's own data should ever
+ * end up behind this: losing access to a subscription must never mean losing
+ * access to your own training or diet history.
+ *
+ * ⚠️ IT IS OFF UNTIL `REQUIRE_SUBSCRIPTION` IS SET, and that is deliberate
+ * rather than timid. There is no payment system yet and nobody holds a
+ * subscription, so switching this on today would refuse every user including
+ * the developer. The flag is the switch to throw on the day the paywall ships
+ * — not a permanent escape hatch, and it should be deleted once it is on.
+ */
+const requireSubscription = async (req, res, next) => {
+    if (process.env.REQUIRE_SUBSCRIPTION !== 'true') return next();
+
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+    if (!token) return res.status(401).json({ error: { message: 'Missing bearer token.' } });
+
+    if (await isEntitled(req.userId, token)) return next();
+
+    console.warn(`[entitlement] ${req.userId} refused: no active subscription`);
+    return res.status(402).json({
+        error: {
+            // 402 Payment Required, and `code` so the app can open the paywall
+            // rather than show a generic failure.
+            code: 'subscription_required',
+            message: 'This feature needs an active subscription.',
         },
     });
 };
@@ -947,7 +1060,68 @@ function pickFoodMatchByWords(searchExpression, foodCore, usable) {
 // gemini-3.1-flash-lite while the app defaulted to gemini-3.6-flash, which made
 // the substitution silent AND a downgrade: an unrecognised model name would not
 // fail, it would quietly answer from a weaker one. Change both together.
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+/**
+ * The two PER-INGREDIENT helpers run on their own models, and not the same one
+ * as each other — because they are not the same kind of task.
+ *
+ * ⚠️ BOTH FIRE ~ONCE PER INGREDIENT, so a 28-meal plan drives ~120+ calls
+ * through here — two orders of magnitude more than the whole app-side
+ * generation pipeline. Neither is covered by the 404/429 fallback in the
+ * handler below, so a quota refusal here is a hard failure, not a downgrade.
+ * That is the constraint everything on this line answers to.
+ *
+ * MATCH is a classification: "which of these five FatSecret rows is the same
+ * food as this string?" There is no reasoning to do and a cheap, high-quota
+ * tier is the right one — the note above `GEMINI_MODEL` has said so since
+ * before this constant existed.
+ *
+ * ESTIMATE is the opposite. It only runs when FatSecret could not price the
+ * food at all, so its numbers go straight into the plan with nothing
+ * downstream to check them. A weak model here does not produce a worse match,
+ * it produces wrong calories the user then eats to. It stays on the capable
+ * model.
+ *
+ * ⚠️ AND IT HAS NO `thinkingConfig`, DELIBERATELY. Thinking would suit the
+ * task, but the cost is per call and there are up to 120 of them in series
+ * with a 120ms pacing gap. Count `[AI Estimate]` lines in one real generation
+ * first: a handful justifies thinking, dozens does not.
+ */
+/**
+ * One greppable line per Gemini call, carrying the only numbers a price can be
+ * computed from.
+ *
+ * ⚠️ TOKENS, NOT CHARACTERS. The existing timing lines report prompt/reply
+ * CHARS, which answers "was it slow" and cannot answer "what did it cost" —
+ * billing is per token, the ratio is not fixed, and thinking tokens do not
+ * appear in the reply at all. `usageMetadata` comes back on every response and
+ * was being discarded.
+ *
+ * ⚠️ `think` IS BILLED AS OUTPUT even though it never reaches the app. It is
+ * broken out rather than folded into `out` precisely so the cost of
+ * `thinkingConfig` is visible as its own number and can be turned off on
+ * evidence.
+ *
+ * ⚠️ `op` IS CLIENT-SUPPLIED AND THEREFORE A HINT — see AI_BUCKETS above. Safe
+ * for measurement, where the worst a liar does is mislabel their own spend.
+ * Never bill from it.
+ *
+ * Format is deliberately key=value so a week of Railway logs can be summed by
+ * operation with a one-line script rather than read by eye.
+ */
+const logUsage = (op, modelName, data, elapsedMs) => {
+    const u = (data && data.usageMetadata) || {};
+    const think = u.thoughtsTokenCount || 0;
+    console.log(
+        `[AI Usage] op=${op} model=${modelName} ` +
+        `in=${u.promptTokenCount ?? '?'} out=${u.candidatesTokenCount ?? '?'} ` +
+        `think=${think} total=${u.totalTokenCount ?? '?'} ms=${elapsedMs}`
+    );
+};
+
+const MATCH_MODEL = process.env.GEMINI_MATCH_MODEL || 'gemini-3.5-flash-lite';
+const ESTIMATE_MODEL = process.env.GEMINI_ESTIMATE_MODEL || 'gemini-3.8-flash';
 
 // Asks Gemini to judge, from the REAL FatSecret candidates for one search,
 // which one (if any) is genuinely the same food as the ingredient - this is
@@ -964,6 +1138,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 // to pickFoodMatchByWords, so a transient AI outage degrades gracefully
 // instead of breaking nutrition lookup entirely.
 async function pickBestFoodMatchWithAI(searchExpression, foodCore, candidates) {
+    const matchStartedAt = Date.now();
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error('GEMINI_API_KEY not configured');
 
@@ -985,7 +1160,7 @@ Respond with ONLY the number of the correct entry, or 0 if none are correct. No 
     const timeoutId = setTimeout(() => controller.abort(), 15000);
     try {
         const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${MATCH_MODEL}:generateContent?key=${apiKey}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -998,6 +1173,7 @@ Respond with ONLY the number of the correct entry, or 0 if none are correct. No 
         );
         if (!response.ok) throw new Error(`Gemini verification call returned ${response.status}`);
         const data = await response.json();
+        logUsage('match', MATCH_MODEL, data, Date.now() - matchStartedAt);
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
         const match = text.match(/\d+/);
         if (!match) throw new Error(`Gemini verification returned unparseable response: "${text}"`);
@@ -1025,6 +1201,7 @@ Respond with ONLY the number of the correct entry, or 0 if none are correct. No 
 // that second gate rather than guess a gram weight for it, same fallback
 // `isPlausible` already uses when it has no reference grams.
 async function estimateIngredientMacrosWithAI(ingredientStr, foodCore) {
+    const estimateStartedAt = Date.now();
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error('GEMINI_API_KEY not configured');
 
@@ -1040,7 +1217,7 @@ Using standard nutrition data for this food, respond with ONLY the protein, carb
     let text;
     try {
         const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${ESTIMATE_MODEL}:generateContent?key=${apiKey}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1053,6 +1230,7 @@ Using standard nutrition data for this food, respond with ONLY the protein, carb
         );
         if (!response.ok) throw new Error(`Gemini estimate call returned ${response.status}`);
         const data = await response.json();
+        logUsage('estimate', ESTIMATE_MODEL, data, Date.now() - estimateStartedAt);
         text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
     } finally {
         clearTimeout(timeoutId);
@@ -1379,13 +1557,15 @@ app.get('/health', async (req, res) => {
 // Body-size note: the limit for this route is set on the GLOBAL express.json()
 // at the top of this file, not here — see the comment there for why a
 // route-level limit doesn't work.
-app.post('/api/ai/generate', requireUser, rateLimitAi, async (req, res) => {
+app.post('/api/ai/generate', requireUser, requireSubscription, rateLimitAi, async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured on the proxy server.' } });
     }
 
     const { contents, generationConfig, model } = req.body || {};
+    /* Only for the usage line — see logUsage on why this is a hint, not a fact. */
+    const operationLabel = typeof req.body?.operation === 'string' ? req.body.operation : null;
     if (!Array.isArray(contents) || contents.length === 0) {
         return res.status(400).json({ error: { message: 'Request must include a non-empty "contents" array.' } });
     }
@@ -1393,8 +1573,29 @@ app.post('/api/ai/generate', requireUser, rateLimitAi, async (req, res) => {
     // Allow the caller to pick a model, but only from a known-good set — an
     // unvalidated passthrough would let anyone who can reach this proxy bill us
     // for an arbitrarily expensive model.
-    const ALLOWED_MODELS = new Set(['gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']);
+    const ALLOWED_MODELS = new Set(['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']);
     const chosenModel = model && ALLOWED_MODELS.has(model) ? model : GEMINI_MODEL;
+
+    /**
+     * The model to retry on when the chosen one cannot serve the request.
+     *
+     * ⚠️ ONLY FOR FAILURES THAT ARE ABOUT THE MODEL, NOT THE REQUEST. 404 means
+     * the model does not exist for this project — which is also the honest
+     * safety net for a name nobody has verified against the live API. 429 means
+     * this model's quota is spent, and a newly-introduced model on promotional
+     * pricing is exactly where a tighter quota shows up first. Both are fast and
+     * definite.
+     *
+     * ⚠️ NOT 400, AND NOT A TIMEOUT. A 400 is a malformed request and the
+     * fallback would fail identically, having spent the round trip. A timeout is
+     * worse: the app owns a 180s deadline and has already aborted by then, so a
+     * retry answers a socket nobody is holding — see the CLIENT ABORTED branch
+     * above. 5xx is left alone too, because `fetchGeminiWithRetry` in the app
+     * already retries those inside its own budget; retrying here as well would
+     * compound into two nested retry loops.
+     */
+    const FALLBACK_MODEL = 'gemini-3.6-flash';
+    const MODEL_FALLBACK_STATUSES = new Set([404, 429]);
 
     /**
      * Timing, because "the AI took too long" is otherwise unanswerable.
@@ -1431,24 +1632,27 @@ app.post('/api/ai/generate', requireUser, rateLimitAi, async (req, res) => {
         }
     });
 
-    try {
-        // No timeout here on purpose: the client already owns the deadline via
-        // its own AbortController, and aborting client-side tears down this
-        // request too. A second, shorter timeout here would just truncate long
-        // (but healthy) generations — a 3.6-flash draft legitimately runs ~70s.
+    /**
+     * One attempt against one model. Returns the status, body and timing so the
+     * caller can decide whether to try the fallback.
+     *
+     * No timeout here on purpose: the client already owns the deadline via its
+     * own AbortController, and aborting client-side tears down this request too.
+     * A second, shorter timeout here would just truncate long (but healthy)
+     * generations — a flash draft legitimately runs ~70s.
+     */
+    const callModel = async (modelName) => {
+        const attemptStart = Date.now();
         const geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${chosenModel}:generateContent?key=${apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ contents, generationConfig }),
             }
         );
-
-        // Mirror Gemini's status so the app's existing handling (429 quota
-        // messaging, 5xx retry in fetchGeminiWithRetry) keeps working unchanged.
         const data = await geminiResponse.json().catch(() => ({}));
-        const elapsedMs = Date.now() - startedAt;
+        const elapsedMs = Date.now() - attemptStart;
         const replyChars = (data?.candidates?.[0]?.content?.parts?.[0]?.text || '').length;
 
         // One line per call, always — a slow SUCCESS is the number that says
@@ -1457,13 +1661,33 @@ app.post('/api/ai/generate', requireUser, rateLimitAi, async (req, res) => {
         // INSIDE its single 180s budget, so several of these lines can belong
         // to one user-visible generation.
         console.log(
-            `[AI Proxy] ${chosenModel} ${geminiResponse.status} in ${elapsedMs}ms — ` +
+            `[AI Proxy] ${modelName} ${geminiResponse.status} in ${elapsedMs}ms — ` +
             `prompt ${promptChars} chars, reply ${replyChars} chars`
         );
-        if (!geminiResponse.ok) {
-            console.warn(`[AI Proxy] Gemini returned ${geminiResponse.status} for model ${chosenModel}`);
+        if (geminiResponse.ok) logUsage(operationLabel || 'unlabelled', modelName, data, elapsedMs);
+        return { status: geminiResponse.status, ok: geminiResponse.ok, data };
+    };
+
+    try {
+        let attempt = await callModel(chosenModel);
+
+        if (!attempt.ok && MODEL_FALLBACK_STATUSES.has(attempt.status) && chosenModel !== FALLBACK_MODEL) {
+            /* ⚠️ LOUD, BECAUSE A SILENT FALLBACK IS A SILENT DOWNGRADE. If the
+               primary model is unavailable or out of quota every single call,
+               everything keeps working and nothing says the cheaper model is
+               never actually being used. Grep this line to find out. */
+            console.warn(
+                `[AI Proxy] ${chosenModel} returned ${attempt.status} — falling back to ${FALLBACK_MODEL}`
+            );
+            attempt = await callModel(FALLBACK_MODEL);
         }
-        return res.status(geminiResponse.status).json(data);
+
+        if (!attempt.ok) {
+            console.warn(`[AI Proxy] Gemini returned ${attempt.status} after ${Date.now() - startedAt}ms`);
+        }
+        // Mirror Gemini's status so the app's existing handling (429 quota
+        // messaging, 5xx retry in fetchGeminiWithRetry) keeps working unchanged.
+        return res.status(attempt.status).json(attempt.data);
     } catch (err) {
         console.error(`[AI Proxy] Request failed after ${Date.now() - startedAt}ms:`, err.message || err);
         return res.status(502).json({ error: { message: `Could not reach the AI service: ${err.message || err}` } });
@@ -1504,7 +1728,7 @@ app.use(['/api/nutrition/analyze', '/api/nutrition/estimate'], (req, res, next) 
 });
 
 // Nutrition Analysis Endpoint
-app.post('/api/nutrition/analyze', requireUser, async (req, res) => {
+app.post('/api/nutrition/analyze', requireUser, requireSubscription, async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
     if (!ingredients || !Array.isArray(ingredients)) {
@@ -1863,7 +2087,7 @@ app.post('/api/nutrition/analyze', requireUser, async (req, res) => {
 // has ALSO failed. Deliberately separate from /api/nutrition/analyze rather
 // than an automatic fallback inside it, so a real database match is always
 // preferred and this only fires for the genuinely unresolvable remainder.
-app.post('/api/nutrition/estimate', requireUser, async (req, res) => {
+app.post('/api/nutrition/estimate', requireUser, requireSubscription, async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
     if (!ingredients || !Array.isArray(ingredients)) {
