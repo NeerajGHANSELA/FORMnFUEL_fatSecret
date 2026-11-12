@@ -135,13 +135,124 @@ const AI_BUCKETS = {
  * generation the user had every right to — exactly the silent failure this
  * paragraph exists to prevent.
  */
-const AI_LIMITS = {
-    workout_generate: 5,
-    diet_generate: 5,
-    workout_swap: 15,
-    diet_swap: 15,
-    machinery: 120,
+/**
+ * ⚠️ TWO WINDOWS IN ONE TABLE. The swap and machinery buckets are PER HOUR and
+ * counted in memory; the two generate buckets are PER CALENDAR MONTH and
+ * counted out of `ai_usage`. `MONTHLY_BUCKETS` below is what says which is
+ * which, and nothing else may infer it from the number.
+ *
+ * A month cannot live in `aiHits`: that Map dies with the container, and this
+ * service is redeployed several times on a busy day. An hourly counter losing
+ * its state costs a user one extra swap; a monthly one losing it means the cap
+ * never existed.
+ */
+/**
+ * A limit, or an override from the environment.
+ *
+ * ⚠️ EXISTS SO A LIMIT CAN BE TESTED WITHOUT EDITING THIS FILE. Walking a
+ * bucket down to 0 to watch the refusal, and then shipping the 0 because the
+ * edit was never reverted, is a foreseeable way to break the app for everyone
+ * — and a constant edited for a test looks identical in review to one edited
+ * on purpose. `AI_LIMIT_NUTRITION=0` on the host is visibly temporary, and
+ * removing it restores the real number with no commit at all.
+ *
+ * Anything that is not a non-negative integer is IGNORED rather than coerced:
+ * a typo'd override must not silently become a limit of NaN, which compares
+ * false against everything and would disable the bucket.
+ */
+const limitFrom = (bucket, fallback) => {
+    const raw = process.env[`AI_LIMIT_${bucket.toUpperCase()}`];
+    if (raw === undefined || raw === '') return fallback;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0) {
+        console.warn(`[ratelimit] ignoring AI_LIMIT_${bucket.toUpperCase()}="${raw}" — want a non-negative integer`);
+        return fallback;
+    }
+    console.warn(`[ratelimit] OVERRIDE: ${bucket} = ${n} (from env, not the default ${fallback})`);
+    return n;
 };
+
+const AI_LIMITS = {
+    /** Per calendar month — see MONTHLY_BUCKETS. */
+    workout_generate: limitFrom('workout_generate', 3),
+    diet_generate: limitFrom('diet_generate', 3),
+    /** Per hour. */
+    workout_swap: limitFrom('workout_swap', 10),
+    diet_swap: limitFrom('diet_swap', 10),
+    /**
+     * ⚠️ THIS COUNTS REQUESTS TO `/api/ai/generate`, NOT GEMINI CALLS, and the
+     * difference is larger than it looks. Ingredient `match` and `estimate`
+     * are logged to `ai_usage` and so SHOW UP beside everything else — a cold
+     * diet generation writes ~115 match rows — but they are made by
+     * `pickBestFoodMatchWithAI` INSIDE a single `/api/nutrition/analyze`
+     * request, and that route carries no limiter at all. They spend nothing
+     * here.
+     *
+     * What a diet generation actually spends from this bucket is only its
+     * unbucketed `/api/ai/generate` calls: ~2 repair_ingredients, ~4
+     * repair_day, ~3 instructions — about 9. Three a month cannot approach
+     * 120, so this stays where it was. It is a loop-breaker, not a ration.
+     *
+     * ⚠️ AND `/api/nutrition/*` BEING UNRATED IS A REAL GAP, just not this
+     * one. Those are the highest-volume AI routes in the service — 162 calls
+     * in thirteen minutes, measured — and only `requireSubscription` stands in
+     * front of them. They are bounded today only because the gated actions
+     * upstream (a generation, a swap) are what drive them.
+     */
+    machinery: limitFrom('machinery', 120),
+    /**
+     * `/api/nutrition/analyze` and `/api/nutrition/estimate` — FatSecret
+     * ingredient pricing, the highest-volume AI route in this service and until
+     * now the only one with no ceiling at all.
+     *
+     * ⚠️ SIZED IN REQUESTS, NOT IN THE `match` ROWS YOU SEE IN `ai_usage`.
+     * `analyzeIngredientsWithFatSecret` is called ONCE PER MEAL, and each call
+     * fans out inside the proxy into one `pickBestFoodMatchWithAI` per
+     * ambiguous ingredient — which is how a measured generation wrote ~115
+     * match rows from roughly 25 requests. Counting the rows would size this
+     * five times too large.
+     *
+     * Legitimate worst case in one hour: ~30 requests per diet generation × the
+     * 3 a month that could all land in the same hour = 90, plus ~20 for ten
+     * meal swaps = ~110. 200 clears that with room while still stopping a
+     * client that calls these directly in a loop, which is the hole this
+     * closes.
+     *
+     * ⚠️ ONE BUCKET FOR BOTH ROUTES ON PURPOSE. `estimate` is the FALLBACK for
+     * ingredients `analyze` could not resolve, so they are two halves of one
+     * act of pricing a meal; separate allowances would let the pair cost double
+     * what either admits to.
+     */
+    nutrition: limitFrom('nutrition', 200),
+};
+
+/**
+ * The buckets counted per calendar month, out of `ai_usage`, rather than per
+ * hour in memory.
+ */
+const MONTHLY_BUCKETS = new Set(['workout_generate', 'diet_generate']);
+
+/**
+ * How close two generate calls must be to count as ONE.
+ *
+ * ⚠️ THIS IS HOW "A FAILED RUN MUST NOT COUNT" IS ENFORCED WITHOUT TRUSTING
+ * THE CLIENT, and it has to be done this way. `logUsage` writes a row for every
+ * Gemini call that returns usage — and a failed generation's call SUCCEEDED;
+ * what failed was the pipeline afterwards, on the device. Only the app knows,
+ * and an app that reports its own failures can always report failure. Any
+ * client-supplied "that one didn't work" fails open.
+ *
+ * Time tells the truth instead: a retry after a failure happens within minutes
+ * by construction, a genuine second plan does not. The measured case —
+ * diet_generate at 04:15:00 failing after three repair rounds and 04:26:01
+ * succeeding, eleven minutes apart — collapses to one charge, while two real
+ * workout plans fifteen hours apart stay two.
+ *
+ * ⚠️ MEASURED FROM THE CLUSTER'S FIRST CALL, NOT THE PREVIOUS ONE. Chaining it
+ * off the previous call would let someone generate every nineteen minutes
+ * forever on a single charge. A cluster is at most this wide, full stop.
+ */
+const RETRY_CLUSTER_MS = 20 * 60 * 1000;
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -184,8 +295,23 @@ setInterval(() => {
  */
 const takeAiToken = (userId, bucket) => {
     const limit = AI_LIMITS[bucket];
-    // An unknown bucket must never fail open into an uncounted free pass.
-    if (!limit) return { ok: true, remaining: Infinity, retryAfterSec: 0 };
+    /**
+     * An unknown bucket must never fail open into an uncounted free pass —
+     * which is why `rateLimitAi` resolves anything unrecognised to 'machinery'
+     * before calling this, making the line below unreachable in practice.
+     *
+     * ⚠️ `=== undefined`, NOT `!limit`. It was the latter, and that made a
+     * limit of ZERO mean UNLIMITED: `!0` is true, so the one value anybody
+     * would reach for to switch a bucket off was the one value that switched
+     * the bucket off in the other direction. Nothing shipped with a 0, so this
+     * never fired in production — but it is a loaded footgun for exactly the
+     * person trying to test a limit.
+     */
+    if (limit === undefined) return { ok: true, remaining: Infinity, retryAfterSec: 0 };
+    if (limit <= 0) {
+        // A deliberate 0 blocks everything, for testing the refusal paths.
+        return { ok: false, remaining: 0, retryAfterSec: Math.ceil(HOUR_MS / 1000) };
+    }
 
     const key = `${userId}:${bucket}`;
     const now = Date.now();
@@ -211,6 +337,75 @@ const takeAiToken = (userId, bucket) => {
 };
 
 /**
+ * The calendar month containing `now`, in UTC.
+ *
+ * ⚠️ UTC, NOT THE USER'S ZONE, and the consequence is worth stating: someone in
+ * Toronto sees their allowance roll over at 8pm on the last day of the month,
+ * not at midnight. The server has no reliable zone for the account — the phone
+ * could send one, and a value that decides an allowance is a value worth lying
+ * about. One predictable instant for everybody beats a per-user boundary the
+ * user can move.
+ */
+const monthWindow = (now = new Date()) => ({
+    start: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
+    end: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)),
+});
+
+/**
+ * How many generations this user has been CHARGED for this calendar month.
+ *
+ * Reads `ai_usage` as the user, under RLS, exactly as `flushUsage` writes it —
+ * the proxy already holds their JWT, so no service-role key has to exist here.
+ * The table has only INSERT and SELECT policies and deliberately no DELETE, so
+ * a user cannot clear their own history to reset the cap.
+ *
+ * Returns null when the answer is genuinely unknown — a failed read, a missing
+ * config — which the caller must not confuse with zero. See its use.
+ */
+const countChargedGenerations = async (token, userId, operation) => {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !token) return null;
+    const { start, end } = monthWindow();
+
+    const url = `${SUPABASE_URL}/rest/v1/ai_usage`
+        + `?select=created_at`
+        + `&user_id=eq.${encodeURIComponent(userId)}`
+        + `&operation=eq.${encodeURIComponent(operation)}`
+        + `&created_at=gte.${encodeURIComponent(start.toISOString())}`
+        + `&order=created_at.asc`;
+
+    let rows;
+    try {
+        const r = await fetch(url, {
+            headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
+        });
+        if (!r.ok) {
+            console.warn(`[ratelimit] ai_usage read returned ${r.status} for ${operation}`);
+            return null;
+        }
+        rows = await r.json();
+    } catch (err) {
+        console.warn('[ratelimit] ai_usage read failed:', err?.message || err);
+        return null;
+    }
+    if (!Array.isArray(rows)) return null;
+
+    /* Rows arrive oldest-first. Every row more than RETRY_CLUSTER_MS after the
+       START of the open cluster begins a new one; everything inside it is the
+       same generation being retried. See RETRY_CLUSTER_MS. */
+    let charged = 0;
+    let clusterStart = 0;
+    for (const row of rows) {
+        const t = Date.parse(row?.created_at);
+        if (!Number.isFinite(t)) continue;
+        if (charged === 0 || t - clusterStart > RETRY_CLUSTER_MS) {
+            charged += 1;
+            clusterStart = t;
+        }
+    }
+    return { charged, resetAt: end };
+};
+
+/**
  * The middleware. Runs AFTER requireUser, which is what puts `req.userId` here.
  *
  * ⚠️ AN UNRECOGNISED OR MISSING LABEL FALLS TO MACHINERY rather than being
@@ -220,31 +415,148 @@ const takeAiToken = (userId, bucket) => {
  * Machinery is generous enough that an old build behaves normally and still
  * cannot loop.
  */
-const rateLimitAi = (req, res, next) => {
+/**
+ * The one 429 body, shared by every limiter so the shape cannot drift.
+ *
+ * `code` so the app can branch without parsing prose, `bucket` so it can pick
+ * the right copy, `window` so it knows whether to say "this hour" or name a
+ * date — the old body said neither and the app's refusal strings hardcode "in
+ * the past hour" for every bucket, which a monthly cap would turn into "you
+ * can build another in about 43200 minutes".
+ *
+ * `limit` is here because the app has been reading `error.limit` since its
+ * rate-limit copy was written and never once received it, falling back to its
+ * own stale duplicate of this table every time.
+ */
+const sendRateLimited = (req, res, { bucket, label, window, retryAfterSec, extra }) => {
+    console.warn(`[ratelimit] ${req.userId} exhausted ${bucket} (label=${label ?? 'none'}, window=${window})`);
+    res.setHeader('Retry-After', String(retryAfterSec));
+    return res.status(429).json({
+        error: {
+            code: 'rate_limited',
+            bucket,
+            window,
+            retryAfterSec,
+            limit: AI_LIMITS[bucket] ?? null,
+            message: 'Too many requests. Try again shortly.',
+            ...extra,
+        },
+    });
+};
+
+/**
+ * The fixed-bucket hourly limiter, for routes whose bucket is known from the
+ * PATH rather than from a body field. `rateLimitAi` cannot serve these: it
+ * reads `req.body.operation` to choose, and these routes have no such field.
+ */
+const rateLimitFixed = (bucket) => (req, res, next) => {
+    const { ok, remaining, retryAfterSec } = takeAiToken(req.userId, bucket);
+    res.setHeader('X-RateLimit-Bucket', bucket);
+    res.setHeader('X-RateLimit-Window', 'hour');
+    res.setHeader('X-RateLimit-Remaining', String(remaining));
+    if (ok) return next();
+    return sendRateLimited(req, res, { bucket, label: null, window: 'hour', retryAfterSec });
+};
+
+const rateLimitAi = async (req, res, next) => {
     const label = typeof req.body?.operation === 'string' ? req.body.operation : null;
     const bucket = (label && AI_BUCKETS[label]) || 'machinery';
+    const limit = AI_LIMITS[bucket];
+
+    const refuse = (window, retryAfterSec, extra) =>
+        sendRateLimited(req, res, { bucket, label, window, retryAfterSec, extra });
+
+    /**
+     * ⚠️ THE WHOLE MONTHLY BRANCH IS WRAPPED, because this middleware is async
+     * and Express 4 does not catch a rejected one — it would hang the request
+     * rather than refuse it, which is the one outcome worse than either answer.
+     * Anything unexpected in here lands in the same place a failed count does:
+     * allow, and say so in the log.
+     */
+    if (MONTHLY_BUCKETS.has(bucket)) try {
+        /**
+         * ⚠️ A REBUILD THE APP ASKED FOR IS NOT THE USER SPENDING THEIR
+         * ALLOWANCE. A diet phase transition regenerates the plan because the
+         * cut ended — the app offers it and rebuilding is HOW the transition
+         * applies — and the Coach upgrade chain does the same. Charging those
+         * to a three-a-month quota takes the allowance away for work the user
+         * never requested, and leaves them unable to progress a phase.
+         *
+         * ⚠️ IT IS THE CLIENT'S WORD, AND THAT IS A KNOWN, BOUNDED TRADE. A
+         * patched app could send this on every call. What it buys is more
+         * generations, still under the hourly machinery ceiling — and anyone
+         * willing to patch the binary would go after `requireSubscription`
+         * above, not the quota. The alternative is the server re-deriving
+         * "was a phase transition really due", which means teaching this
+         * middleware the whole diet-phase model to close a hole nobody is
+         * standing in.
+         */
+        if (req.body?.initiated === 'app') {
+            res.setHeader('X-RateLimit-Bucket', bucket);
+            res.setHeader('X-RateLimit-Window', 'month');
+            return next();
+        }
+
+        /* A deliberate 0 refuses without a database round trip — and without
+           it the read below would run only to be ignored. Matches takeAiToken's
+           own handling of 0 on the hourly side. */
+        if (limit <= 0) {
+            res.setHeader('X-RateLimit-Bucket', bucket);
+            res.setHeader('X-RateLimit-Window', 'month');
+            res.setHeader('X-RateLimit-Remaining', '0');
+            const { end } = monthWindow();
+            return refuse('month', Math.max(1, Math.ceil((end.getTime() - Date.now()) / 1000)),
+                { resetAt: end.toISOString() });
+        }
+
+        const caller = callerContext.getStore();
+        const got = await countChargedGenerations(caller?.token, req.userId, label);
+
+        /**
+         * ⚠️ A FAILED READ IS NOT ZERO, AND IT IS NOT THE LIMIT EITHER. It is
+         * "cannot tell", and this fails OPEN on it — deliberately, and the same
+         * way the in-memory counter already fails when a deploy clears it. The
+         * cost of being wrong in this direction is one extra generation; in the
+         * other it is a paying subscriber refused the thing they pay for
+         * because Supabase blipped. The hourly machinery ceiling still applies
+         * underneath, so "open" is not "unbounded".
+         */
+        if (!got) {
+            console.warn(`[ratelimit] ${req.userId} ${bucket}: month count unavailable, allowing`);
+            res.setHeader('X-RateLimit-Bucket', bucket);
+            res.setHeader('X-RateLimit-Window', 'month');
+            return next();
+        }
+
+        const remaining = Math.max(0, limit - got.charged);
+        res.setHeader('X-RateLimit-Bucket', bucket);
+        res.setHeader('X-RateLimit-Window', 'month');
+        res.setHeader('X-RateLimit-Remaining', String(remaining));
+        res.setHeader('X-RateLimit-Reset', got.resetAt.toISOString());
+
+        if (got.charged >= limit) {
+            return refuse(
+                'month',
+                Math.max(1, Math.ceil((got.resetAt.getTime() - Date.now()) / 1000)),
+                { resetAt: got.resetAt.toISOString() },
+            );
+        }
+        return next();
+    } catch (err) {
+        console.warn('[ratelimit] monthly check threw, allowing:', err?.message || err);
+        return next();
+    }
 
     const { ok, remaining, retryAfterSec } = takeAiToken(req.userId, bucket);
 
     // Sent on every response, not only refusals: a client that can see its own
     // headroom can back off before it is told to.
     res.setHeader('X-RateLimit-Bucket', bucket);
+    res.setHeader('X-RateLimit-Window', 'hour');
     res.setHeader('X-RateLimit-Remaining', String(remaining));
 
     if (ok) return next();
-
-    console.warn(`[ratelimit] ${req.userId} exhausted ${bucket} (label=${label ?? 'none'})`);
-    res.setHeader('Retry-After', String(retryAfterSec));
-    return res.status(429).json({
-        error: {
-            // `code` so the app can branch on the reason without parsing prose,
-            // and `bucket` so it can pick the right banner copy.
-            code: 'rate_limited',
-            bucket,
-            retryAfterSec,
-            message: 'Too many requests. Try again shortly.',
-        },
-    });
+    return refuse('hour', retryAfterSec);
 };
 
 /**
@@ -323,8 +635,57 @@ const isEntitled = async (userId, token) => {
  * the developer. The flag is the switch to throw on the day the paywall ships
  * — not a permanent escape hatch, and it should be deleted once it is on.
  */
+/**
+ * The operations a Core (unpaid) account legitimately needs.
+ *
+ * ⚠️ WITHOUT THIS LIST, TURNING ON `REQUIRE_SUBSCRIPTION` BREAKS MANUAL PLAN
+ * BUILDING. This middleware guards the whole route and had no per-operation
+ * exemption, so the day the flag goes on, a Core user saving a hand-built plan
+ * gets a 402 from inside `handleSaveManualSchedule` — and the app has no copy
+ * for that, because nobody designed a paywall for a free feature. It fails at
+ * the save, after the quiz, which is the worst place to discover it.
+ *
+ * Audited against every operation the app sends, so an addition to one side is
+ * visibly an addition to this list too:
+ *
+ *   FREE — the manual builder cannot work without them
+ *     workout_exercise_classify         handleSaveManualSchedule
+ *     workout_exercise_match            updateScheduleInPlace, on the same save
+ *     workout_manual_exercise_estimate  the hand-typed swap sheet, which
+ *                                       activeWorkout opens for every unpaid
+ *                                       account (`manualSwap`)
+ *
+ *   PAID — Coach writes or rewrites a plan
+ *     workout_generate, diet_generate, diet_generate_repair_day,
+ *     diet_generate_repair_ingredients, diet_generate_instructions,
+ *     workout_exercise_swap, workout_exercise_swap_estimate, diet_meal_swap,
+ *     diet_meal_swap_named, diet_meal_swap_evaluate, diet_prep_instructions,
+ *     body_fat_estimate
+ *
+ * ⚠️ `body_fat_estimate` IS PAID, AND WAS THE LEAK. It is a model call that
+ * sat behind no client gate at all, so Core users were spending tokens on it
+ * for free. The app now refuses it on the manual path; this refuses it here,
+ * which is the half a patched client cannot skip.
+ *
+ * ⚠️ THE NUTRITION ROUTES CARRY NO `operation` AND SO ARE NOT FREE, which is
+ * correct: `/api/nutrition/analyze` and `/estimate` are only ever reached from
+ * AI generation and meal swaps, both of which are Coach. Manual food logging
+ * does not touch the proxy.
+ */
+const FREE_OPERATIONS = new Set([
+    'workout_exercise_classify',
+    'workout_exercise_match',
+    'workout_manual_exercise_estimate',
+]);
+
 const requireSubscription = async (req, res, next) => {
     if (process.env.REQUIRE_SUBSCRIPTION !== 'true') return next();
+
+    /* Checked before entitlement, not after: a free operation must not depend
+       on a subscriptions read succeeding, or an outage takes manual plan
+       building down with it. */
+    const label = typeof req.body?.operation === 'string' ? req.body.operation : null;
+    if (label && FREE_OPERATIONS.has(label)) return next();
 
     const header = req.headers.authorization || '';
     const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
@@ -332,7 +693,9 @@ const requireSubscription = async (req, res, next) => {
 
     if (await isEntitled(req.userId, token)) return next();
 
-    console.warn(`[entitlement] ${req.userId} refused: no active subscription`);
+    /* Names the operation, so an addition that should have been free shows up
+       in the logs as itself rather than as a vague refusal. */
+    console.warn(`[entitlement] ${req.userId} refused ${label ?? req.path}: no active subscription`);
     return res.status(402).json({
         error: {
             // 402 Payment Required, and `code` so the app can open the paywall
@@ -1884,7 +2247,7 @@ app.use(['/api/nutrition/analyze', '/api/nutrition/estimate'], (req, res, next) 
 });
 
 // Nutrition Analysis Endpoint
-app.post('/api/nutrition/analyze', requireUser, requireSubscription, async (req, res) => {
+app.post('/api/nutrition/analyze', requireUser, requireSubscription, rateLimitFixed('nutrition'), async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
     if (!ingredients || !Array.isArray(ingredients)) {
@@ -2243,7 +2606,7 @@ app.post('/api/nutrition/analyze', requireUser, requireSubscription, async (req,
 // has ALSO failed. Deliberately separate from /api/nutrition/analyze rather
 // than an automatic fallback inside it, so a real database match is always
 // preferred and this only fires for the genuinely unresolvable remainder.
-app.post('/api/nutrition/estimate', requireUser, requireSubscription, async (req, res) => {
+app.post('/api/nutrition/estimate', requireUser, requireSubscription, rateLimitFixed('nutrition'), async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
     if (!ingredients || !Array.isArray(ingredients)) {
