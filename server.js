@@ -102,7 +102,32 @@ if (!supabaseAuth) {
 const AI_BUCKETS = {
     workout_generate: 'workout_generate',
     diet_generate: 'diet_generate',
+    /**
+     * ⚠️ THREE SWAP SURFACES, THREE BUCKETS, BECAUSE THEY NOW HAVE THREE
+     * DIFFERENT LIMITS. They were one label on one allowance; splitting them
+     * is what lets the mid-session swap be metered PER WORKOUT while the two
+     * that have no workout to be counted against stay per hour. The labels are
+     * also what `ai_usage.operation` records, so this buys per-surface cost
+     * reporting that the single label could not give.
+     */
     workout_exercise_swap: 'workout_swap',
+    /**
+     * ⚠️ THE SAME BUCKET AS THE SWAP IT BACKS, AND THAT CLOSES A HOLE. This is
+     * the FALLBACK route, taken when the main swap cannot price a replacement
+     * — and it was in no bucket at all, so it resolved to `machinery` and its
+     * 120 an hour. A user whose swaps kept failing could spend well past ten
+     * against a workout through this door alone, which made the per-workout
+     * cap advisory rather than real.
+     *
+     * The same reasoning `nutrition` already records for analyze/estimate:
+     * they are two halves of ONE act, and separate allowances let the pair
+     * cost double what either admits to. The consequence is honest — a swap
+     * that falls back spends two of the ten — because what the limit bounds is
+     * calls we pay for, and a fallback is one of them.
+     */
+    workout_exercise_swap_estimate: 'workout_swap',
+    workout_plan_swap: 'workout_plan_swap',
+    workout_stuck_swap: 'workout_stuck_swap',
     diet_meal_swap: 'diet_swap',
     diet_meal_swap_named: 'diet_swap',
 };
@@ -176,8 +201,26 @@ const AI_LIMITS = {
     /** Per calendar month — see MONTHLY_BUCKETS. */
     workout_generate: limitFrom('workout_generate', 3),
     diet_generate: limitFrom('diet_generate', 3),
-    /** Per hour. */
+    /**
+     * Per WORKOUT — see PER_WORKOUT_BUCKETS. Ten swaps against the workout you
+     * are actually doing, so Push, Pull and Legs each carry their own ten
+     * rather than sharing one hourly pool.
+     */
     workout_swap: limitFrom('workout_swap', 10),
+    /** Per hour. */
+    /**
+     * The review screen, before a plan is saved.
+     *
+     * ⚠️ IT CANNOT BE PER WORKOUT, AND NOT FOR WANT OF TRYING. At this point
+     * the plan exists only in the client's memory: no `workout` rows, nothing
+     * in `day_assignments`, so there is no id the server can count against and
+     * no id it could trust if the client invented one. Per hour is the honest
+     * limit for a surface with no durable subject, and 5 is sized for
+     * fine-tuning a generated plan rather than rewriting it.
+     */
+    workout_plan_swap: limitFrom('workout_plan_swap', 5),
+    /** The plateau / "stuck" suggestion path — same reasoning, its own 5. */
+    workout_stuck_swap: limitFrom('workout_stuck_swap', 5),
     diet_swap: limitFrom('diet_swap', 10),
     /**
      * ⚠️ THIS COUNTS REQUESTS TO `/api/ai/generate`, NOT GEMINI CALLS, and the
@@ -233,6 +276,23 @@ const AI_LIMITS = {
 const MONTHLY_BUCKETS = new Set(['workout_generate', 'diet_generate']);
 
 /**
+ * Buckets counted PER WORKOUT rather than per user — the key gains the workout
+ * id, so each workout carries its own allowance.
+ *
+ * ⚠️ THE WINDOW IS A DAY, NOT A SESSION, and that is a deliberate
+ * approximation. "Ten swaps per workout" means ten while you are doing it; a
+ * session does not span midnight, so a daily window is indistinguishable from
+ * per-session in practice and needs no session id threaded through the client.
+ * The cost of the approximation is that two sessions of the same workout on one
+ * day share an allowance, which is not a thing anyone does.
+ *
+ * ⚠️ AND IT FALLS BACK TO THE PER-USER KEY WHEN NO WORKOUT ID ARRIVES. An
+ * unkeyed per-workout bucket would be an uncounted free pass, which is the one
+ * outcome a limiter may never produce.
+ */
+const PER_WORKOUT_BUCKETS = new Set(['workout_swap']);
+
+/**
  * How close two generate calls must be to count as ONE.
  *
  * ⚠️ THIS IS HOW "A FAILED RUN MUST NOT COUNT" IS ENFORCED WITHOUT TRUSTING
@@ -255,6 +315,7 @@ const MONTHLY_BUCKETS = new Set(['workout_generate', 'diet_generate']);
 const RETRY_CLUSTER_MS = 20 * 60 * 1000;
 
 const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 /**
  * `${userId}:${bucket}` -> { count, resetAt }.
@@ -293,7 +354,7 @@ setInterval(() => {
  * deliberate timing, caps out at roughly double for one burst, and is what a
  * sliding window would fix if the logs ever show someone riding it.
  */
-const takeAiToken = (userId, bucket) => {
+const takeAiToken = (userId, bucket, scope = null) => {
     const limit = AI_LIMITS[bucket];
     /**
      * An unknown bucket must never fail open into an uncounted free pass —
@@ -308,17 +369,24 @@ const takeAiToken = (userId, bucket) => {
      * person trying to test a limit.
      */
     if (limit === undefined) return { ok: true, remaining: Infinity, retryAfterSec: 0 };
+    /* Per-workout buckets run on a day; everything else on an hour. Read once
+       so the refusal below and the window set below cannot disagree. */
+    const windowMs = PER_WORKOUT_BUCKETS.has(bucket) ? DAY_MS : HOUR_MS;
+
     if (limit <= 0) {
         // A deliberate 0 blocks everything, for testing the refusal paths.
-        return { ok: false, remaining: 0, retryAfterSec: Math.ceil(HOUR_MS / 1000) };
+        return { ok: false, remaining: 0, retryAfterSec: Math.ceil(windowMs / 1000) };
     }
 
-    const key = `${userId}:${bucket}`;
+    /* `scope` is the workout id for a per-workout bucket, and null everywhere
+       else — see PER_WORKOUT_BUCKETS for why a missing one degrades to the
+       plain per-user key rather than to no key at all. */
+    const key = scope ? `${userId}:${bucket}:${scope}` : `${userId}:${bucket}`;
     const now = Date.now();
     const hit = aiHits.get(key);
 
     if (!hit || hit.resetAt <= now) {
-        aiHits.set(key, { count: 1, resetAt: now + HOUR_MS });
+        aiHits.set(key, { count: 1, resetAt: now + windowMs });
         return { ok: true, remaining: limit - 1, retryAfterSec: 0 };
     }
 
@@ -547,16 +615,30 @@ const rateLimitAi = async (req, res, next) => {
         return next();
     }
 
-    const { ok, remaining, retryAfterSec } = takeAiToken(req.userId, bucket);
+    /**
+     * ⚠️ CLIENT-SUPPLIED, AND BOUNDED THE SAME WAY `operation` IS. A patched
+     * client could rotate this to mint fresh allowances — but every swap it
+     * bought would still be a real Gemini call behind `requireSubscription`,
+     * and anyone willing to patch the binary would go after that instead. What
+     * it buys legitimately is the thing the hour could not express: Push, Pull
+     * and Legs each holding their own ten.
+     */
+    const workoutId = typeof req.body?.workoutId === 'string' && req.body.workoutId
+        ? req.body.workoutId
+        : null;
+    const scope = PER_WORKOUT_BUCKETS.has(bucket) ? workoutId : null;
+    const windowName = PER_WORKOUT_BUCKETS.has(bucket) && scope ? 'workout' : 'hour';
+
+    const { ok, remaining, retryAfterSec } = takeAiToken(req.userId, bucket, scope);
 
     // Sent on every response, not only refusals: a client that can see its own
     // headroom can back off before it is told to.
     res.setHeader('X-RateLimit-Bucket', bucket);
-    res.setHeader('X-RateLimit-Window', 'hour');
+    res.setHeader('X-RateLimit-Window', windowName);
     res.setHeader('X-RateLimit-Remaining', String(remaining));
 
     if (ok) return next();
-    return refuse('hour', retryAfterSec);
+    return refuse(windowName, retryAfterSec);
 };
 
 /**
@@ -609,11 +691,36 @@ const isEntitled = async (userId, token) => {
         return false;
     }
 
-    const ENTITLED = ['active', 'trialing', 'grace', 'cancelled'];
-    const ok = !!data
-        && ENTITLED.includes(data.status)
-        && !!data.expires_at
-        && new Date(data.expires_at).getTime() > Date.now();
+    /**
+     * ⚠️ THE STATUS DECIDES; THE DATE IS ASKED ONLY WHERE THE STATUS MEANS
+     * "ENDING". This was `ENTITLED.includes(status) && expires_at > now`,
+     * which is right for exactly one of the four live statuses:
+     *
+     *   grace     — a card the store is RETRYING. Its expires_at is in the
+     *               past BY DEFINITION; that is what grace is. The old rule
+     *               refused AI to a customer who was still paying, for days,
+     *               while the app (same bug, same shape) hid their plan.
+     *   active    — between a period ending and the RENEWAL webhook landing a
+     *   trialing    healthy subscription reads as unpaid. Seconds, usually,
+     *               but this result is CACHED for ENTITLEMENT_TTL_MS, so a
+     *               refusal taken in that window outlives it.
+     *   cancelled — renewal off, paid period not over. The one case the date
+     *               answers, and now the only place it is asked.
+     *   expired   — RevenueCat's EXPIRATION: a lapsed grace period, or Google
+     *               moving an account to hold. The only "it is over".
+     *
+     * ⚠️ THIRD COPY OF THE RULE, AND THE OTHER TWO MOVED WITH IT:
+     * my-app/src/lib/subscriptionStatus.ts (the only tested one) and the
+     * database's `subscription_is_active`. This function has never called
+     * that one — it reads the columns and decides for itself — so the three
+     * have to be changed together or the proxy refuses to generate for
+     * someone the app is showing a plan to.
+     */
+    const ok = !data ? false
+        : data.status === 'expired' ? false
+            : data.status === 'cancelled'
+                ? (!!data.expires_at && new Date(data.expires_at).getTime() > Date.now())
+                : ['active', 'trialing', 'grace'].includes(data.status);
 
     entitlementCache.set(userId, { ok, at: Date.now() });
     return ok;
