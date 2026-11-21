@@ -2755,4 +2755,39 @@ app.post('/api/nutrition/estimate', requireUser, requireSubscription, rateLimitF
 
 app.listen(PORT, () => {
     console.log(`FORMnFUEL FatSecret Proxy Server running on port ${PORT}`);
+
+    /**
+     * Which mode the paywall came up in, stated by the process that loaded it.
+     *
+     * ⚠️ THE FLAG IS A SILENT, CASE-SENSITIVE MATCH ON `'true'`, and that is
+     * the whole reason this line exists. `requireSubscription` tests
+     * `!== 'true'`, so `True`, `TRUE`, `1` and `yes` all leave enforcement OFF
+     * — with the variable present in the dashboard, spelled correctly, looking
+     * exactly like it is working. There is no error, no warning, and no
+     * difference visible anywhere except by going unsubscribed and trying to
+     * generate a plan.
+     *
+     * Reported the same way as the `[ratelimit] OVERRIDE:` lines above, and
+     * for the same reason: the deploy log should say what this server actually
+     * loaded, not what someone believes they set. That is how the limits were
+     * confirmed to be on their defaults in production.
+     *
+     * ⚠️ IT REPORTS, IT DOES NOT DECIDE. The test below must stay a mirror of
+     * the one in `requireSubscription` — if that one changes, this says the
+     * wrong thing confidently, which is worse than saying nothing.
+     */
+    const enforcing = process.env.REQUIRE_SUBSCRIPTION === 'true';
+    const raw = process.env.REQUIRE_SUBSCRIPTION;
+    if (enforcing) {
+        console.log('[auth] subscription enforcement ON — paid operations require an active subscription');
+    } else if (raw !== undefined && raw !== '') {
+        /* Set, but not to the one value that counts. This is the failure the
+           line exists to catch, so it names what was found. */
+        console.warn(
+            `[auth] subscription enforcement OFF — REQUIRE_SUBSCRIPTION="${raw}" is not the exact string "true". ` +
+            'Every signed-in account may call paid operations.',
+        );
+    } else {
+        console.warn('[auth] subscription enforcement OFF — every signed-in account may call paid operations');
+    }
 });
