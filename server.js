@@ -17,6 +17,34 @@ app.use(cors());
 // a route-level 25mb limit in place).
 app.use(express.json({ limit: '25mb' }));
 
+/**
+ * Forward a rejected async handler to the error handler below.
+ *
+ * ⚠️ EXPRESS 4 DOES NOT CATCH A REJECTED PROMISE, AND NODE 22 EXITS ON ONE.
+ * Both are true of this process: `express ^4.19.2`, `engines.node >= 22`. So
+ * an async route or middleware that throws does not return 500 — it takes the
+ * whole server down, for every user, from any authenticated caller.
+ *
+ * Confirmed by probe: `{"ingredients":[123]}` reached
+ * `(123 || '').trim()` in /api/nutrition/analyze, and the process was gone.
+ * The restart also wipes `aiHits`, the in-memory limiter, so crashing the
+ * server was the cheapest way to mint a fresh hourly allowance.
+ *
+ * ⚠️ IT COVERS MIDDLEWARE TOO, NOT JUST ROUTES. Today only
+ * `requireSubscription` has a bare `await` — `requireUser` keeps its inside a
+ * try, and `rateLimitAi`'s hourly path is synchronous — but the class reopens
+ * the moment anyone adds an await to any of them, and wrapping costs nothing.
+ *
+ * ⚠️ AND IT MUST NOT SWALLOW `rateLimitAi`'s DELIBERATE FAIL-OPEN. That
+ * middleware catches its own monthly failures and calls `next()` with a log
+ * saying "allowing" — a cost control choosing to let the request through
+ * rather than refuse on a bad read. This wrapper only sees what those catches
+ * do not, so the fail-open stays a decision rather than becoming an accident
+ * of plumbing. If that should ever fail CLOSED instead, change it there and
+ * change its comments with it.
+ */
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 // ---------------------------------------------------------------------------
 // Authentication
 // ---------------------------------------------------------------------------
@@ -2069,7 +2097,7 @@ const DEEP_PROBE_TTL_MS = 60_000;
  * "is the nutrition service actually working" becomes a question with an
  * answer rather than an inference.
  */
-app.get('/health', async (req, res) => {
+app.get('/health', wrap(async (req, res) => {
     /**
      * ⚠️ THE SHALLOW ANSWER NOW REFLECTS REAL TRAFFIC, which is the whole point.
      * It used to be hardcoded "ok" and said so for 46 hours through one outage
@@ -2158,7 +2186,7 @@ app.get('/health', async (req, res) => {
     // probe passes while lookups are being refused, something is wrong that a
     // single "chicken breast" query does not reach, and "ok" would be a lie.
     return res.json({ ...body, status: result.ok && !degraded ? 'ok' : 'degraded', fatSecret: result });
-});
+}));
 
 // ---------------------------------------------------------------------------
 // Gemini generateContent proxy
@@ -2175,7 +2203,7 @@ app.get('/health', async (req, res) => {
 // Body-size note: the limit for this route is set on the GLOBAL express.json()
 // at the top of this file, not here — see the comment there for why a
 // route-level limit doesn't work.
-app.post('/api/ai/generate', requireUser, requireSubscription, rateLimitAi, async (req, res) => {
+app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), wrap(rateLimitAi), wrap(async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured on the proxy server.' } });
@@ -2318,7 +2346,7 @@ app.post('/api/ai/generate', requireUser, requireSubscription, rateLimitAi, asyn
         console.error(`[AI Proxy] Request failed after ${Date.now() - startedAt}ms:`, err.message || err);
         return res.status(502).json({ error: { message: `Could not reach the AI service: ${err.message || err}` } });
     }
-});
+}));
 
 /**
  * Timing for the nutrition routes.
@@ -2354,11 +2382,20 @@ app.use(['/api/nutrition/analyze', '/api/nutrition/estimate'], (req, res, next) 
 });
 
 // Nutrition Analysis Endpoint
-app.post('/api/nutrition/analyze', requireUser, requireSubscription, rateLimitFixed('nutrition'), async (req, res) => {
+app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription), rateLimitFixed('nutrition'), wrap(async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
-    if (!ingredients || !Array.isArray(ingredients)) {
+    /* ⚠️ THE ELEMENTS, NOT JUST THE ARRAY. `Array.isArray` alone let
+       `[123]` through to `(123 || '').trim()` below — a number is truthy, so
+       the `|| ''` guard does not catch it — and that TypeError inside an async
+       handler took the process down. `foodCores` is validated too because it
+       is indexed in parallel with `ingredients` a few lines on. */
+    if (!Array.isArray(ingredients) || !ingredients.every(i => typeof i === 'string')) {
         return res.status(400).json({ error: "ingredients must be an array of strings" });
+    }
+    if (foodCores !== undefined
+        && (!Array.isArray(foodCores) || !foodCores.every(c => c == null || typeof c === 'string'))) {
+        return res.status(400).json({ error: "foodCores must be an array of strings or nulls" });
     }
 
     // Pair each ingredient with its food_core (if any) before filtering out blank
@@ -2705,7 +2742,7 @@ app.post('/api/nutrition/analyze', requireUser, requireSubscription, rateLimitFi
         console.error("FatSecret Proxy integration failure:", err);
         return res.status(500).json({ error: "Internal proxy server error: " + err.message });
     }
-});
+}));
 
 // Last-resort estimate endpoint - the caller (DietSetupFlow) only reaches for
 // this after /api/nutrition/analyze has already failed to resolve an
@@ -2713,11 +2750,20 @@ app.post('/api/nutrition/analyze', requireUser, requireSubscription, rateLimitFi
 // has ALSO failed. Deliberately separate from /api/nutrition/analyze rather
 // than an automatic fallback inside it, so a real database match is always
 // preferred and this only fires for the genuinely unresolvable remainder.
-app.post('/api/nutrition/estimate', requireUser, requireSubscription, rateLimitFixed('nutrition'), async (req, res) => {
+app.post('/api/nutrition/estimate', wrap(requireUser), wrap(requireSubscription), rateLimitFixed('nutrition'), wrap(async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
-    if (!ingredients || !Array.isArray(ingredients)) {
+    /* ⚠️ THE ELEMENTS, NOT JUST THE ARRAY. `Array.isArray` alone let
+       `[123]` through to `(123 || '').trim()` below — a number is truthy, so
+       the `|| ''` guard does not catch it — and that TypeError inside an async
+       handler took the process down. `foodCores` is validated too because it
+       is indexed in parallel with `ingredients` a few lines on. */
+    if (!Array.isArray(ingredients) || !ingredients.every(i => typeof i === 'string')) {
         return res.status(400).json({ error: "ingredients must be an array of strings" });
+    }
+    if (foodCores !== undefined
+        && (!Array.isArray(foodCores) || !foodCores.every(c => c == null || typeof c === 'string'))) {
+        return res.status(400).json({ error: "foodCores must be an array of strings or nulls" });
     }
 
     const paired = ingredients
@@ -2751,6 +2797,96 @@ app.post('/api/nutrition/estimate', requireUser, requireSubscription, rateLimitF
     }
 
     return res.json({ items, failed });
+}));
+
+/**
+ * What a caller is told, which is as little as is still true.
+ *
+ * ⚠️ 413 IS SPLIT OUT because "Bad request." describes it wrongly — the
+ * request was well-formed and too big, and that is the one 4xx here a caller
+ * can actually act on. The size limit is discoverable by anyone willing to
+ * bisect, so naming it discloses nothing.
+ */
+const errorMessageFor = (status) => {
+    if (status >= 500) return 'Internal server error.';
+    if (status === 413) return 'Request body too large.';
+    return 'Bad request.';
+};
+
+/**
+ * The last word on any request that threw.
+ *
+ * ⚠️ REGISTERED AFTER EVERY ROUTE, which is the only position Express accepts
+ * for a four-argument handler. Anything above that calls `next(err)` — every
+ * `wrap`ped route and middleware, and body-parser's own 400 and 413 — lands
+ * here instead of in Express's default page.
+ *
+ * ⚠️ IT PRESERVES THE STATUS AND REPLACES THE BODY. `err.status` carries
+ * body-parser's 413 for an oversized body and 400 for malformed JSON, and
+ * flattening those to 500 would turn two honest client errors into a claim
+ * that the server broke. Only the BODY is fixed.
+ *
+ * ⚠️ AND THE FIXED BODY IS WHY THIS CLOSES THE STACK-TRACE LEAK IN CODE
+ * RATHER THAN IN A DASHBOARD. Express's default handler prints the stack
+ * unless NODE_ENV is 'production'. Whether the host sets that is the host's
+ * business and is not asserted here — probing production found no stack, but
+ * nothing in this repo guarantees it, and the next place this runs (staging,
+ * a local tunnel, a second project) would leak paths and line numbers with no
+ * warning. This makes it a property of the code instead.
+ *
+ * ⚠️ THE STATUS IS CLAMPED TO 400–599, and that line is load-bearing. An
+ * error carrying `status: 'abc'` made `res.status()` ITSELF throw, Express
+ * fell back to its default handler, and the stack page this exists to
+ * suppress went out anyway — the leak, reintroduced by the fix. `status: 999`
+ * merely reached the client as 999. Anything that is not a plausible HTTP
+ * error code is the server's problem, so it reads as 500.
+ *
+ * ⚠️ THE BODY CARRIES A REQUEST ID AND THE LOG LINE CARRIES THE SAME ONE.
+ * The message is deliberately uninformative — the app maps status to its own
+ * copy and never shows this text — so the id is the only thread back from
+ * "it failed" to the stack that explains why. It is random per error, says
+ * nothing about the request, and the client's `proxyError` already logs the
+ * whole body, so it reaches the debug console with no client change.
+ */
+app.use((err, req, res, next) => {
+    /* A response already on the wire cannot be rewritten — hand it back to
+       Express, whose default handler will close the connection. */
+    if (res.headersSent) return next(err);
+
+    /* Only a plausible HTTP error code survives; see the clamp note above. */
+    const raw = err?.status ?? err?.statusCode;
+    const status = Number.isInteger(raw) && raw >= 400 && raw <= 599 ? raw : 500;
+
+    /* Short, random, meaningless on its own — the join between this log line
+       and whatever the caller reports. */
+    const requestId = crypto.randomUUID().slice(0, 8);
+
+    console.error(
+        `[error] ${requestId} ${req.method} ${req.path} -> ${status}:`,
+        err?.stack || err?.message || err,
+    );
+    res.status(status).json({
+        error: { message: errorMessageFor(status), requestId },
+    });
+});
+
+/**
+ * The net, and only the net.
+ *
+ * ⚠️ IT PREVENTS THE EXIT AND NOTHING ELSE. Node 22 terminates on an unhandled
+ * rejection; this stops that, so one bad request can no longer restart the
+ * process and wipe `aiHits` with it. It does NOT answer the request whose
+ * promise rejected — that client waits out its own timeout. `wrap` above is
+ * what turns a rejection into a 500; this is what stops the service dying
+ * while something nobody wrapped is found.
+ *
+ * ⚠️ A PROCESS KEPT ALIVE HERE IS IN AN UNDEFINED STATE, which is the usual
+ * argument against doing this. It is accepted because this server is
+ * stateless apart from the rate-limit counters — and those are precisely what
+ * a restart destroys, so staying up is the safer failure.
+ */
+process.on('unhandledRejection', (err) => {
+    console.error('[fatal] unhandled rejection, staying up:', err?.message || err);
 });
 
 app.listen(PORT, () => {
