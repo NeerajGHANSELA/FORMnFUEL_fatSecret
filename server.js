@@ -229,6 +229,36 @@ const AI_LIMITS = {
     /** Per calendar month — see MONTHLY_BUCKETS. */
     workout_generate: limitFrom('workout_generate', 3),
     diet_generate: limitFrom('diet_generate', 3),
+
+    /**
+     * The HOURLY ceiling under each monthly bucket — see HOURLY_FOR_MONTHLY.
+     *
+     * ⚠️ THE MONTHLY BUCKETS HAD NO HOURLY LIMIT AT ALL, which is not what the
+     * comments in `rateLimitAi` claimed. Every exit of its monthly block
+     * returns, and `takeAiToken` is called after that block, so for these two
+     * buckets it was simply unreachable. `initiated: 'app'` then returns before
+     * the monthly count is even read — so one client-supplied string meant no
+     * limit of any kind on the two most expensive calls in the service.
+     *
+     * ⚠️ THEY ARE SEPARATE ENTRIES, NOT ONE REUSED THROUGH `scope`. `scope` is
+     * "the workout id for a per-workout bucket, and null everywhere else"; a
+     * bucket name threaded through it would make the parameter mean two
+     * unrelated things. Two entries also let the numbers move apart, and the
+     * two callers are not symmetric — see below.
+     *
+     * ⚠️ SIX, AND THE SAME SIX ON BOTH, which is a choice rather than an
+     * oversight. The hourly counter does NOT cluster retries and the monthly
+     * one does: `countChargedGenerations` folds everything inside
+     * RETRY_CLUSTER_MS into one charge, while `takeAiToken` counts requests —
+     * so a diet phase transition that retries twice is 1 monthly and 3 hourly.
+     * Six clears two full retry runs in an hour. Workout generation does not
+     * retry at all, so 4 would have been safe there and was considered; it was
+     * dropped because the asymmetry buys nothing against the abuse path this
+     * exists to bound, and costs a second number to explain. Against the abuse
+     * path, 4 and 6 are the same answer: bounded.
+     */
+    workout_generate_hourly: limitFrom('workout_generate_hourly', 6),
+    diet_generate_hourly: limitFrom('diet_generate_hourly', 6),
     /**
      * Per WORKOUT — see PER_WORKOUT_BUCKETS. Ten swaps against the workout you
      * are actually doing, so Push, Pull and Legs each carry their own ten
@@ -302,6 +332,24 @@ const AI_LIMITS = {
  * hour in memory.
  */
 const MONTHLY_BUCKETS = new Set(['workout_generate', 'diet_generate']);
+
+/**
+ * Monthly bucket -> the hourly bucket that sits underneath it.
+ *
+ * ⚠️ A MISSING ENTRY FAILS OPEN, so adding a third monthly bucket and
+ * forgetting this line restores the old hole silently. The assertion at the
+ * bottom of this block is what refuses to let that ship.
+ */
+const HOURLY_FOR_MONTHLY = {
+    workout_generate: 'workout_generate_hourly',
+    diet_generate: 'diet_generate_hourly',
+};
+
+for (const b of MONTHLY_BUCKETS) {
+    if (!HOURLY_FOR_MONTHLY[b] || AI_LIMITS[HOURLY_FOR_MONTHLY[b]] === undefined) {
+        throw new Error(`[ratelimit] monthly bucket '${b}' has no hourly ceiling — add it to HOURLY_FOR_MONTHLY and AI_LIMITS`);
+    }
+}
 
 /**
  * Buckets counted PER WORKOUT rather than per user — the key gains the workout
@@ -563,6 +611,43 @@ const rateLimitAi = async (req, res, next) => {
         sendRateLimited(req, res, { bucket, label, window, retryAfterSec, extra });
 
     /**
+     * The hourly ceiling under a monthly bucket. Every ALLOW path of the
+     * monthly block below goes through here instead of calling `next()`.
+     *
+     * ⚠️ IT DOES NOT USE `refuse`. That closure captures the MONTHLY bucket,
+     * and `sendRateLimited` fills `limit` from `AI_LIMITS[bucket]` — so an
+     * hourly refusal routed through it would ship `window: 'hour'` beside
+     * `limit: 3`, the monthly allowance, and the client renders that as "You
+     * have built 3 diet plans in the past hour. You can build another in about
+     * 40 minutes." Every number in that sentence is wrong. Naming the hourly
+     * bucket makes `limit` resolve to the hourly figure on its own, and the
+     * client falls to its generic line, which is the true one.
+     *
+     * ⚠️ THE HEADERS NAME THE HOURLY BUCKET TOO, and that is protective rather
+     * than cosmetic: `captureAllowance` keys its store by `X-RateLimit-Bucket`,
+     * so an hourly number arriving under the monthly name would overwrite the
+     * "N plans left this month" the UI reads. Under its own name nothing reads
+     * it, and the monthly figure survives. `X-RateLimit-Reset` is dropped for
+     * the same reason — a month date on an hour refusal is simply false.
+     *
+     * ⚠️ `label` IS KEPT AS THE ORIGINAL OPERATION so the warn line still says
+     * which call was refused rather than naming the ceiling twice.
+     */
+    const allowUnderHourlyCeiling = () => {
+        const hourlyBucket = HOURLY_FOR_MONTHLY[bucket];
+        const { ok, retryAfterSec } = takeAiToken(req.userId, hourlyBucket);
+        if (ok) return next();
+
+        res.removeHeader('X-RateLimit-Reset');
+        res.setHeader('X-RateLimit-Bucket', hourlyBucket);
+        res.setHeader('X-RateLimit-Window', 'hour');
+        res.setHeader('X-RateLimit-Remaining', '0');
+        return sendRateLimited(req, res, {
+            bucket: hourlyBucket, label, window: 'hour', retryAfterSec,
+        });
+    };
+
+    /**
      * ⚠️ THE WHOLE MONTHLY BRANCH IS WRAPPED, because this middleware is async
      * and Express 4 does not catch a rejected one — it would hang the request
      * rather than refuse it, which is the one outcome worse than either answer.
@@ -578,19 +663,27 @@ const rateLimitAi = async (req, res, next) => {
          * to a three-a-month quota takes the allowance away for work the user
          * never requested, and leaves them unable to progress a phase.
          *
-         * ⚠️ IT IS THE CLIENT'S WORD, AND THAT IS A KNOWN, BOUNDED TRADE. A
-         * patched app could send this on every call. What it buys is more
-         * generations, still under the hourly machinery ceiling — and anyone
-         * willing to patch the binary would go after `requireSubscription`
-         * above, not the quota. The alternative is the server re-deriving
-         * "was a phase transition really due", which means teaching this
-         * middleware the whole diet-phase model to close a hole nobody is
-         * standing in.
+         * ⚠️ IT IS THE CLIENT'S WORD, AND THE BOUND IT RELIED ON DID NOT EXIST.
+         * This paragraph used to say the trade was safe because what the string
+         * buys is "more generations, still under the hourly machinery ceiling".
+         * There was no such ceiling: every exit of this block returns, and
+         * `takeAiToken` is called after it, so for a monthly bucket it was
+         * unreachable. The string bought no limit of any kind on the two most
+         * expensive calls in the service. It is true now because
+         * `allowUnderHourlyCeiling` makes it true.
+         *
+         * ⚠️ EXACTLY ONE CLIENT SITE SENDS IT, and it is narrower than this
+         * comment used to claim. `DietSetupFlow.tsx` sends it on a phase
+         * transition, carrying `diet_generate` and nothing else — the Coach
+         * upgrade chain was named here and sends nothing. So a request
+         * carrying it on `workout_generate` came from a stale build or from
+         * someone poking at the API, which is the other reason the ceiling
+         * belongs under this branch rather than beside it.
          */
         if (req.body?.initiated === 'app') {
             res.setHeader('X-RateLimit-Bucket', bucket);
             res.setHeader('X-RateLimit-Window', 'month');
-            return next();
+            return allowUnderHourlyCeiling();
         }
 
         /* A deliberate 0 refuses without a database round trip — and without
@@ -614,14 +707,19 @@ const rateLimitAi = async (req, res, next) => {
          * way the in-memory counter already fails when a deploy clears it. The
          * cost of being wrong in this direction is one extra generation; in the
          * other it is a paying subscriber refused the thing they pay for
-         * because Supabase blipped. The hourly machinery ceiling still applies
-         * underneath, so "open" is not "unbounded".
+         * because Supabase blipped.
+         *
+         * ⚠️ "OPEN" IS NOT "UNBOUNDED" — AND NOW THAT IS TRUE. This sentence
+         * was here before the hourly ceiling was, claiming a bound that the
+         * control flow made unreachable. `allowUnderHourlyCeiling` is what it
+         * was always describing, and this is the path that needs it most: a
+         * Supabase outage is exactly when the monthly count stops counting.
          */
         if (!got) {
             console.warn(`[ratelimit] ${req.userId} ${bucket}: month count unavailable, allowing`);
             res.setHeader('X-RateLimit-Bucket', bucket);
             res.setHeader('X-RateLimit-Window', 'month');
-            return next();
+            return allowUnderHourlyCeiling();
         }
 
         const remaining = Math.max(0, limit - got.charged);
@@ -637,10 +735,13 @@ const rateLimitAi = async (req, res, next) => {
                 { resetAt: got.resetAt.toISOString() },
             );
         }
-        return next();
+        return allowUnderHourlyCeiling();
     } catch (err) {
+        /* Same reasoning as the unavailable-count path: a throw here is the
+           monthly counter going quiet, which is when the hourly one carries
+           the whole load. Failing open past BOTH would be unbounded. */
         console.warn('[ratelimit] monthly check threw, allowing:', err?.message || err);
-        return next();
+        return allowUnderHourlyCeiling();
     }
 
     /**
