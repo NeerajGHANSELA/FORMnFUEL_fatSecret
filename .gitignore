@@ -1,2 +1,9 @@
 node_modules/
 .env
+
+# Security review working notes. They enumerate live findings against this
+# service by file and line, so they stay local — a repo is the wrong place to
+# keep a map of the holes, and these go stale the moment one is fixed.
+# Patterns, not names, because they are dated and there will be more.
+SECURITY-SCAN-*.md
+*-RETEST-*.md
