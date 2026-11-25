@@ -764,63 +764,62 @@ const isEntitled = async (userId, token) => {
  * end up behind this: losing access to a subscription must never mean losing
  * access to your own training or diet history.
  *
- * ⚠️ IT IS OFF UNTIL `REQUIRE_SUBSCRIPTION` IS SET, and that is deliberate
- * rather than timid. There is no payment system yet and nobody holds a
- * subscription, so switching this on today would refuse every user including
- * the developer. The flag is the switch to throw on the day the paywall ships
- * — not a permanent escape hatch, and it should be deleted once it is on.
+ * ⚠️ IT IS OFF UNTIL `REQUIRE_SUBSCRIPTION` IS SET — and it IS set now. This
+ * paragraph used to say there was no payment system and nobody held a
+ * subscription, which was true when the flag was written and has not been
+ * true since RevenueCat shipped. The boot line at the bottom of this file
+ * prints which mode the process actually came up in; trust that over any
+ * comment, this one included.
+ *
+ * ⚠️ THE TEST IS A CASE-SENSITIVE EXACT MATCH ON `'true'`. `True`, `TRUE` and
+ * `1` all leave enforcement OFF, silently, with every paid operation free to
+ * everyone. There is no warning for that because the flag being absent is a
+ * legitimate state; the boot line is the only thing that will tell you.
  */
 /**
- * The operations a Core (unpaid) account legitimately needs.
+ * ⚠️ THERE IS NO PER-OPERATION EXEMPTION, AND THAT IS THE FIX (H1).
  *
- * ⚠️ WITHOUT THIS LIST, TURNING ON `REQUIRE_SUBSCRIPTION` BREAKS MANUAL PLAN
- * BUILDING. This middleware guards the whole route and had no per-operation
- * exemption, so the day the flag goes on, a Core user saving a hand-built plan
- * gets a 402 from inside `handleSaveManualSchedule` — and the app has no copy
- * for that, because nobody designed a paywall for a free feature. It fails at
- * the save, after the quiz, which is the worst place to discover it.
+ * A `FREE_OPERATIONS` set used to sit here, naming three operations a Core
+ * account was allowed to spend model tokens on. It was read from
+ * `req.body.operation` — a value the CLIENT chooses — while
+ * `/api/ai/generate` is a deliberate thin pass-through of `contents`. So
+ * writing `"operation": "workout_exercise_classify"` on top of ANY prompt
+ * bought a Gemini call with no subscription at all. A bill, not a breach: the
+ * route returns model output and touches no user data.
  *
- * Audited against every operation the app sends, so an addition to one side is
- * visibly an addition to this list too:
+ * ⚠️ THE EXEMPTION WAS NOT WRONG WHEN IT WAS WRITTEN. Without it, turning on
+ * `REQUIRE_SUBSCRIPTION` gave a Core user a 402 at the save button, after the
+ * quiz, with no copy for it — the three operations really were load-bearing
+ * for manual plan building. What changed is the CLIENT:
  *
- *   FREE — the manual builder cannot work without them
- *     workout_exercise_classify         handleSaveManualSchedule
- *     workout_exercise_match            updateScheduleInPlace, on the same save
- *     workout_manual_exercise_estimate  the hand-typed swap sheet, which
- *                                       activeWorkout opens for every unpaid
- *                                       account (`manualSwap`)
+ *   workout_exercise_classify         deleted outright. Tracking type is a
+ *                                     control the user taps; show_rep_ceiling
+ *                                     resolves from keywords and rep ranges.
+ *   workout_exercise_match            Coach only. `matchExercisesByName` grew a
+ *                                     third deterministic pass, so Core's
+ *                                     training log still follows a rebuild
+ *                                     without a model.
+ *   workout_manual_exercise_estimate  was never reachable by Core — activeWorkout
+ *                                     routes an unpaid account to
+ *                                     ManualSwapSheet, which has no AI at all.
  *
- *   PAID — Coach writes or rewrites a plan
- *     workout_generate, diet_generate, diet_generate_repair_day,
- *     diet_generate_repair_ingredients, diet_generate_instructions,
- *     workout_exercise_swap, workout_exercise_swap_estimate, diet_meal_swap,
- *     diet_meal_swap_named, diet_meal_swap_evaluate, diet_prep_instructions,
- *     body_fat_estimate
+ * ⚠️ AN OLDER CLIENT DOES NOT BREAK ON THIS, which is why it could ship ahead
+ * of the app. All three call sites swallow their failures: classify falls
+ * through to the style default, match is "warned, never thrown" and returns
+ * [], and a 402 is indistinguishable from the timeout each already handles.
+ * An old build degrades — manual exercises save as weight_reps and a rebuild
+ * loses fuzzy history pairing — it does not fail.
  *
- * ⚠️ `body_fat_estimate` IS PAID, AND WAS THE LEAK. It is a model call that
- * sat behind no client gate at all, so Core users were spending tokens on it
- * for free. The app now refuses it on the manual path; this refuses it here,
- * which is the half a patched client cannot skip.
- *
- * ⚠️ THE NUTRITION ROUTES CARRY NO `operation` AND SO ARE NOT FREE, which is
- * correct: `/api/nutrition/analyze` and `/estimate` are only ever reached from
- * AI generation and meal swaps, both of which are Coach. Manual food logging
- * does not touch the proxy.
+ * ⚠️ IF A FUTURE OPERATION NEEDS TO BE FREE, DO NOT REINTRODUCE THE SET. The
+ * defect was not the list, it was trusting a client-supplied label to make an
+ * authorisation decision on a route that forwards a client-supplied prompt.
+ * Give it its own route with its own fixed prompt, or bound it so hard that
+ * being free is worthless — pinned model, server-built prompt, no client
+ * `generationConfig`.
  */
-const FREE_OPERATIONS = new Set([
-    'workout_exercise_classify',
-    'workout_exercise_match',
-    'workout_manual_exercise_estimate',
-]);
 
 const requireSubscription = async (req, res, next) => {
     if (process.env.REQUIRE_SUBSCRIPTION !== 'true') return next();
-
-    /* Checked before entitlement, not after: a free operation must not depend
-       on a subscriptions read succeeding, or an outage takes manual plan
-       building down with it. */
-    const label = typeof req.body?.operation === 'string' ? req.body.operation : null;
-    if (label && FREE_OPERATIONS.has(label)) return next();
 
     const header = req.headers.authorization || '';
     const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
@@ -829,7 +828,13 @@ const requireSubscription = async (req, res, next) => {
     if (await isEntitled(req.userId, token)) return next();
 
     /* Names the operation, so an addition that should have been free shows up
-       in the logs as itself rather than as a vague refusal. */
+       in the logs as itself rather than as a vague refusal.
+
+       ⚠️ READ HERE, AND ONLY FOR THE LOG. It used to be read at the top of the
+       function, where it decided whether to skip the paywall — that was H1.
+       It is a client-supplied string and it no longer influences anything;
+       keep it that way. */
+    const label = typeof req.body?.operation === 'string' ? req.body.operation : null;
     console.warn(`[entitlement] ${req.userId} refused ${label ?? req.path}: no active subscription`);
     return res.status(402).json({
         error: {
