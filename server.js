@@ -70,7 +70,7 @@ const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch
 // works whatever algorithm the project signs with, and it respects revocation
 // (a locally-verified signature keeps accepting a token from a deleted or
 // signed-out user until it expires).
-const { createClient } = require('@supabase/supabase-js');
+const { createClient, isAuthRetryableFetchError } = require('@supabase/supabase-js');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -1026,6 +1026,41 @@ const requireUser = async (req, res, next) => {
 
     try {
         const { data, error } = await supabaseAuth.auth.getUser(token);
+
+        /**
+         * ⚠️ AN UNREACHABLE AUTH SERVICE IS NOT A BAD TOKEN, and separating the
+         * two is the whole point of this branch. `getUser` does NOT throw when
+         * the network fails or Supabase returns a 5xx — auth-js wraps that as
+         * an `AuthRetryableFetchError` and hands it back in `error`, so it fell
+         * into the 401 below with everything else. The catch underneath carries
+         * a comment saying "a network failure talking to Supabase is NOT
+         * permission to proceed", which was the right intent attached to a
+         * branch the SDK never reaches for this case.
+         *
+         * ⚠️ IT IS NOT A COSMETIC STATUS CHANGE. `proxyFetch` retries exactly
+         * one status — 401 — by calling `refreshSession()`, and during an auth
+         * outage that refresh fails too. So the client answered an outage by
+         * trying to re-authenticate against the service that was down, then
+         * rendered the original 401 as "You have been signed out. Please sign
+         * in again to continue." The user is told their session died, and
+         * signing in again cannot work until the outage ends. 503 skips the
+         * refresh (`res.status !== 401` returns early) and maps to "The plan
+         * service is having trouble. Please try again shortly." — true, and
+         * it does not send them to a login screen that cannot help.
+         *
+         * A genuinely bad token is a 4xx from Supabase, is not retryable, and
+         * still lands on the 401 below. Nothing changes for a revoked session.
+         */
+        if (error && isAuthRetryableFetchError(error)) {
+            /* ⚠️ THE STATUS CARRIES THE INFORMATION, NOT THE MESSAGE. auth-js
+               passes a 5xx body straight through, and Supabase's is empty — so
+               a real outage logs its message as the literal "{}" while
+               `status` says 503. A dead host is `status: 0, "fetch failed"`.
+               Printing both is what separates "never answered" from "answered
+               badly", which are different incidents. */
+            console.warn(`[auth] Supabase unreachable (status ${error.status ?? '?'}): ${error.message}`);
+            return res.status(503).json({ error: { message: 'Could not verify credentials.' } });
+        }
         if (error || !data?.user) {
             return res.status(401).json({ error: { message: 'Invalid or expired token.' } });
         }
