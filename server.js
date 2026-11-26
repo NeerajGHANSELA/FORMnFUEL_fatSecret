@@ -9,13 +9,41 @@ const PORT = process.env.PORT || 4000;
 const USE_NATIVE_NLP = process.env.USE_NATIVE_NLP === 'true';
 
 app.use(cors());
-// 25mb, not the 100kb default: /api/ai/generate forwards Gemini requests that
-// can carry up to four body-composition photos as base64 inlineData. This has
-// to be set HERE rather than as a per-route express.json({limit}) — this global
-// parser runs first for every route, so it would 413 the request before any
-// route-level limit was ever consulted (confirmed: a 2MB body was rejected with
-// a route-level 25mb limit in place).
-app.use(express.json({ limit: '25mb' }));
+
+/**
+ * ⚠️ THERE IS NO GLOBAL BODY PARSER, AND THAT IS DELIBERATE (M4).
+ *
+ * `app.use(express.json({ limit: '25mb' }))` used to sit here, and it meant
+ * ANYONE on the internet could make this process buffer 25 MB per connection
+ * before a single line of auth ran: the parser is mounted before the routes, so
+ * it read and parsed the whole body and only then did `requireUser` answer 401.
+ * Confirmed against the deployed build — a 24 MiB body with no token was read
+ * in full, then refused.
+ *
+ * Each route mounts its own parser INSIDE its chain, after `requireUser` and
+ * `requireSubscription`. An unauthenticated upload is now refused on the
+ * headers and the stream is never read.
+ *
+ * ⚠️ THE OLD COMMENT WAS RIGHT WHEN IT WAS WRITTEN, which is why this one
+ * explains what changed rather than deleting it. It said a route-level limit
+ * "doesn't work" because the global parser 413s first — true, and still true:
+ * the two cannot coexist, and a small global parser plus a large route-level
+ * one fails exactly that way. What it could not anticipate is that the global
+ * parser would stop being necessary. It was load-bearing because
+ * `requireSubscription` read `req.body.operation` to decide whether to charge
+ * for the call, so the body HAD to be parsed before authorisation. H1 deleted
+ * that: no middleware reads the body to make an authorisation decision any
+ * more, so the parser is free to move after them.
+ *
+ * ⚠️ 25 MB STAYS ON THE GENERATE ROUTE. `WorkoutSetupFlow` sends up to four
+ * body-composition photos as base64 `inlineData` in ONE request, from pickers
+ * at `quality: 0.6` with no resize step anywhere in the client — so the payload
+ * is bounded by the device's camera, not by us. Whether the ceiling should be
+ * lower is open and needs Gemini's actual size rule read rather than recalled:
+ * its 20 MB inline limit inverts depending on whether it counts the base64
+ * text or the bytes it decodes to, and 4/3 is wide enough to decide it either
+ * way. Until that is read, this is the number the client was built against.
+ */
 
 /**
  * Forward a rejected async handler to the error handler below.
@@ -934,7 +962,17 @@ const requireSubscription = async (req, res, next) => {
        ⚠️ READ HERE, AND ONLY FOR THE LOG. It used to be read at the top of the
        function, where it decided whether to skip the paywall — that was H1.
        It is a client-supplied string and it no longer influences anything;
-       keep it that way. */
+       keep it that way.
+
+       ⚠️ AND SINCE M4 IT IS USUALLY NULL HERE, so this falls back to
+       `req.path`. The parser moved after this middleware, so a 402 is answered
+       before the body is read — which is the point, since it stops an
+       unsubscribed account making us buffer 25 MB. The cost is that every 402
+       on the generate route now logs the same path string, and WHICH operation
+       a Core user keeps hitting the paywall on is no longer in the log. That
+       was an H1-adjacent signal and it is a real loss. If it is wanted back,
+       the answer is the client sending the operation in a HEADER, which is
+       readable before any body — not moving the parser back. */
     const label = typeof req.body?.operation === 'string' ? req.body.operation : null;
     console.warn(`[entitlement] ${req.userId} refused ${label ?? req.path}: no active subscription`);
     return res.status(402).json({
@@ -2341,10 +2379,15 @@ app.get('/health', wrap(async (req, res) => {
 // Deliberately a thin pass-through: the caller still owns the prompt,
 // generationConfig and (optionally) the model, so adding/'changing a prompt
 // never needs a proxy change. Only the credential moves.
-// Body-size note: the limit for this route is set on the GLOBAL express.json()
-// at the top of this file, not here — see the comment there for why a
-// route-level limit doesn't work.
-app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), wrap(rateLimitAi), wrap(async (req, res) => {
+/* ⚠️ `express.json` IS NOT WRAPPED, and must not be. `wrap` exists for
+   middleware that returns a PROMISE; body-parser reports through `next(err)`
+   already, which is what carries its 413 and its malformed-JSON 400 to the
+   error handler. Wrapping it would add a layer that never fires.
+
+   ⚠️ IT SITS AFTER BOTH GUARDS. `rateLimitAi` needs `req.body` — operation,
+   initiated, workoutId — so the parser has to precede it; nothing above it
+   does, since H1. */
+app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '25mb' }), wrap(rateLimitAi), wrap(async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured on the proxy server.' } });
@@ -2502,28 +2545,45 @@ app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), wrap(
  * ~10-minute meal generation: the AI calls have a 180s ceiling each and now log
  * their duration, but this stage had no number attached to it at all.
  *
- * Registered BEFORE the handlers so it wraps them, and after the body parser so
- * `ingredients` is populated — the count is what makes a slow line
- * interpretable, since 40 ingredients legitimately takes longer than 6.
+ * Registered BEFORE the handlers so it wraps them. The count is what makes a
+ * slow line interpretable, since 40 ingredients legitimately takes longer
+ * than 6.
+ *
+ * ⚠️ THE COUNT IS READ IN THE CALLBACKS, NOT HERE, and that is load-bearing
+ * since M4. This is an `app.use`, so it runs before the route's own chain —
+ * and the parser now lives INSIDE that chain, after `requireUser`. Read at
+ * entry, `req.body` is undefined and every line in this log would have said
+ * "0 ingredient(s)" for ever. By `finish` the body has been parsed if it was
+ * ever going to be.
+ *
+ * ⚠️ SO "0 ingredient(s)" NO LONGER MEANS "AN EMPTY ARRAY WAS SENT". It also
+ * covers a 401, a 402 and a 413 — every case where the body was never parsed
+ * at all. Read the status on the same line before drawing a conclusion from
+ * the count. The comment this replaced promised the opposite, which is how
+ * this dependency went unnoticed.
  */
 app.use(['/api/nutrition/analyze', '/api/nutrition/estimate'], (req, res, next) => {
     const startedAt = Date.now();
-    const count = Array.isArray(req.body && req.body.ingredients) ? req.body.ingredients.length : 0;
+    const count = () => (Array.isArray(req.body && req.body.ingredients) ? req.body.ingredients.length : 0);
 
     res.on('finish', () => {
-        console.log(`[Nutrition] ${req.path} ${res.statusCode} in ${Date.now() - startedAt}ms — ${count} ingredient(s)`);
+        console.log(`[Nutrition] ${req.path} ${res.statusCode} in ${Date.now() - startedAt}ms — ${count()} ingredient(s)`);
     });
     // The app gives up at 180s; from here that is only ever a closed socket.
     res.on('close', () => {
         if (!res.writableEnded) {
-            console.warn(`[Nutrition] CLIENT ABORTED ${req.path} after ${Date.now() - startedAt}ms — ${count} ingredient(s)`);
+            console.warn(`[Nutrition] CLIENT ABORTED ${req.path} after ${Date.now() - startedAt}ms — ${count()} ingredient(s)`);
         }
     });
     next();
 });
 
 // Nutrition Analysis Endpoint
-app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription), rateLimitFixed('nutrition'), wrap(async (req, res) => {
+/* 100kb, not 25mb: these carry ingredient NAME lists. A generation's ~115
+   match rows arrive across about 25 requests, so a handful of short strings
+   each — two orders of magnitude of headroom, and no reason for this route to
+   be able to buffer what the photo route can. */
+app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), rateLimitFixed('nutrition'), wrap(async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
     /* ⚠️ THE ELEMENTS, NOT JUST THE ARRAY. `Array.isArray` alone let
@@ -2891,7 +2951,7 @@ app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription),
 // has ALSO failed. Deliberately separate from /api/nutrition/analyze rather
 // than an automatic fallback inside it, so a real database match is always
 // preferred and this only fires for the genuinely unresolvable remainder.
-app.post('/api/nutrition/estimate', wrap(requireUser), wrap(requireSubscription), rateLimitFixed('nutrition'), wrap(async (req, res) => {
+app.post('/api/nutrition/estimate', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), rateLimitFixed('nutrition'), wrap(async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
     /* ⚠️ THE ELEMENTS, NOT JUST THE ARRAY. `Array.isArray` alone let
