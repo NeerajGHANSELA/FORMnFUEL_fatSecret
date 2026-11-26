@@ -241,17 +241,29 @@ const AI_BUCKETS = {
  * a typo'd override must not silently become a limit of NaN, which compares
  * false against everything and would disable the bucket.
  */
-const limitFrom = (bucket, fallback) => {
-    const raw = process.env[`AI_LIMIT_${bucket.toUpperCase()}`];
+/**
+ * A non-negative integer from the environment, or the fallback — announcing
+ * both the override and the typo.
+ *
+ * ⚠️ A BAD VALUE MUST NOT BECOME `NaN`. `Number('')` is 0 and `Number('six')`
+ * is NaN, and either silently flowing into a limit or a token cap is worse
+ * than the default it replaced: NaN compares false against everything, so a
+ * cap of NaN is a cap of none.
+ */
+const envInt = (varName, fallback, announce) => {
+    const raw = process.env[varName];
     if (raw === undefined || raw === '') return fallback;
     const n = Number(raw);
     if (!Number.isInteger(n) || n < 0) {
-        console.warn(`[ratelimit] ignoring AI_LIMIT_${bucket.toUpperCase()}="${raw}" — want a non-negative integer`);
+        console.warn(`${announce} ignoring ${varName}="${raw}" — want a non-negative integer`);
         return fallback;
     }
-    console.warn(`[ratelimit] OVERRIDE: ${bucket} = ${n} (from env, not the default ${fallback})`);
+    console.warn(`${announce} OVERRIDE: ${varName} = ${n} (from env, not the default ${fallback})`);
     return n;
 };
+
+const limitFrom = (bucket, fallback) =>
+    envInt(`AI_LIMIT_${bucket.toUpperCase()}`, fallback, '[ratelimit]');
 
 const AI_LIMITS = {
     /** Per calendar month — see MONTHLY_BUCKETS. */
@@ -661,6 +673,152 @@ const sendRateLimited = (req, res, { bucket, label, window, retryAfterSec, extra
  * PATH rather than from a body field. `rateLimitAi` cannot serve these: it
  * reads `req.body.operation` to choose, and these routes have no such field.
  */
+/**
+ * The generation config actually sent upstream, built from scratch (M5).
+ *
+ * ⚠️ A WHITELIST, NEVER A BLACKLIST, and the difference is the finding. The
+ * old line was `{ ...(generationConfig || {}) }` — every key the client sent
+ * reached Gemini, and the only one anyone had thought about was
+ * `thinkingConfig`. A blacklist has to name tomorrow's parameter today;
+ * copying four known keys cannot be surprised by a fifth.
+ *
+ * ⚠️ `responseModalities` IS THE ONE TO UNDERSTAND. It is how you ask Gemini
+ * for image or audio output, which bills on a different card entirely. No
+ * client sends it, nothing here could use the answer, and it was forwarded.
+ *
+ * ⚠️ IT IS PURE, AND NAMED, ON PURPOSE. The outbound call cannot be observed
+ * without a key, so the only way to test what is forwarded is to run this
+ * function directly. Config in, `{ config, warnings }` out, no I/O.
+ *
+ * ⚠️ IT ADDS KEYS THE CALLER DID NOT SEND — `maxOutputTokens` and
+ * `candidateCount` — so the result is deliberately NOT "the client's config
+ * minus the bad parts". A legitimate request is one that produces no
+ * warnings, not one that comes back unchanged.
+ */
+const GENERATION_CONFIG_KEYS = new Set([
+    'responseMimeType', 'temperature', 'maxOutputTokens', 'thinkingConfig', 'candidateCount',
+]);
+
+const buildGenerationConfig = (raw) => {
+    const warnings = [];
+    const note = (key, what) => warnings.push(`${key}: ${what}`);
+
+    const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+    const src = isPlainObject(raw) ? raw : {};
+    if (raw !== undefined && raw !== null && !isPlainObject(raw)) {
+        note('generationConfig', `was ${Array.isArray(raw) ? 'an array' : typeof raw}; treated as absent`);
+    }
+
+    const config = {};
+
+    if (src.responseMimeType !== undefined) {
+        if (ALLOWED_RESPONSE_MIME_TYPES.has(src.responseMimeType)) {
+            config.responseMimeType = src.responseMimeType;
+        } else {
+            note('responseMimeType', `${JSON.stringify(src.responseMimeType)} is not forwarded; dropped`);
+        }
+    }
+
+    /**
+     * ⚠️ TYPE-CHECKED, NOT CLAMPED TO THE VALUE WE HAPPEN TO USE. Temperature
+     * costs nothing — it does not change how many tokens come back — so a
+     * ceiling below Gemini's own [0, 2] would be a product opinion about
+     * output quality wearing a cost control's clothes, and it would silently
+     * reshape a future experiment with no log line anyone would connect to it.
+     */
+    if (src.temperature !== undefined) {
+        const t = src.temperature;
+        if (typeof t === 'number' && Number.isFinite(t) && t >= 0 && t <= 2) {
+            config.temperature = t;
+        } else {
+            note('temperature', `${JSON.stringify(t)} is outside [0, 2] or not a number; dropped`);
+        }
+    }
+
+    /**
+     * ⚠️ IMPOSED WHEN ABSENT, which is the half a clamp alone would miss: of
+     * every caller in the app exactly one sets this (the diet main draft, at
+     * the cap), so clamping only what arrives would leave "just omit the key"
+     * as the way round it, bounded by whatever Google defaults to rather than
+     * by us.
+     *
+     * Imposing it cannot raise real spend, and the reason is worth keeping:
+     * `maxOutputTokens` is a CEILING, not a target — a model that finishes
+     * early is unaffected by a higher one. If any call were truncating at
+     * Google's default today its JSON would not parse and the feature would be
+     * visibly broken, which it is not. So nothing legitimate is sitting at the
+     * limit, and raising it changes nothing except that the route now has one
+     * known maximum instead of "ours, or whatever Google decided".
+     */
+    const maxOut = src.maxOutputTokens;
+    if (maxOut === undefined) {
+        config.maxOutputTokens = GEMINI_MAX_OUTPUT_TOKENS;
+    } else if (Number.isInteger(maxOut) && maxOut >= 1) {
+        config.maxOutputTokens = Math.min(maxOut, GEMINI_MAX_OUTPUT_TOKENS);
+        if (maxOut > GEMINI_MAX_OUTPUT_TOKENS) {
+            note('maxOutputTokens', `${maxOut} clamped to ${GEMINI_MAX_OUTPUT_TOKENS}`);
+        }
+    } else {
+        config.maxOutputTokens = GEMINI_MAX_OUTPUT_TOKENS;
+        note('maxOutputTokens', `${JSON.stringify(maxOut)} is not a positive integer; using ${GEMINI_MAX_OUTPUT_TOKENS}`);
+    }
+
+    /**
+     * ⚠️ A BUDGET OF 0 IS A REAL ANSWER AND MUST SURVIVE. It means "no
+     * thinking", which is the cheapest a call can be — and `!budget` is true
+     * for it, so any falsy test silently replaces the cheapest request with
+     * the 1024 default. `takeAiToken` carries the same warning about `!limit`
+     * versus `limit === undefined`; this is that trap in a second place.
+     */
+    let budget = DEFAULT_THINKING_BUDGET;
+    const tc = src.thinkingConfig;
+    if (tc !== undefined) {
+        if (!isPlainObject(tc)) {
+            note('thinkingConfig', `was ${Array.isArray(tc) ? 'an array' : typeof tc}; using the default budget`);
+        } else if (tc.thinkingBudget !== undefined) {
+            const b = tc.thinkingBudget;
+            if (Number.isInteger(b) && b >= 0) {
+                budget = Math.min(b, GEMINI_MAX_THINKING);
+                if (b > GEMINI_MAX_THINKING) {
+                    note('thinkingConfig.thinkingBudget', `${b} clamped to ${GEMINI_MAX_THINKING}`);
+                }
+            } else {
+                note('thinkingConfig.thinkingBudget', `${JSON.stringify(b)} is not a non-negative integer; using ${DEFAULT_THINKING_BUDGET}`);
+            }
+        }
+    }
+    /**
+     * `includeThoughts` is never read from the client: thoughts are output
+     * this proxy would carry back to a caller that ignores them.
+     *
+     * ⚠️ IT WARNS ONLY WHEN THE CALLER ASKED FOR TRUE. The diet main draft
+     * sends `includeThoughts: false` explicitly, so warning on mere presence
+     * would log on every real diet generation and destroy the property the
+     * rest of this function is built on — that a legitimate request produces
+     * no warnings at all. Overriding `false` with `false` is not an override.
+     */
+    if (isPlainObject(tc) && tc.includeThoughts !== undefined && tc.includeThoughts !== false) {
+        note('thinkingConfig.includeThoughts', `${JSON.stringify(tc.includeThoughts)} is not forwarded; forced to false`);
+    }
+    config.thinkingConfig = { thinkingBudget: budget, includeThoughts: false };
+
+    /* The handler reads `candidates[0]` and nothing else, so any other count
+       is output we pay for and then discard. Set explicitly rather than left
+       to the default, so the forwarded body states its own bound. */
+    if (src.candidateCount !== undefined && src.candidateCount !== 1) {
+        note('candidateCount', `${JSON.stringify(src.candidateCount)} is not forwarded; forced to 1`);
+    }
+    config.candidateCount = 1;
+
+    for (const key of Object.keys(src)) {
+        if (!GENERATION_CONFIG_KEYS.has(key)) {
+            note(key, 'is not a forwarded parameter; dropped');
+        }
+    }
+
+    return { config, warnings };
+};
+
 /**
  * @param costOf optional `(req) => number`. Omitted, every request costs 1,
  *               which is what "fixed" meant when this only served one shape.
@@ -1992,6 +2150,31 @@ const ESTIMATE_THINKING_BUDGET = Number(process.env.GEMINI_ESTIMATE_THINKING ?? 
  */
 const DEFAULT_THINKING_BUDGET = Number(process.env.GEMINI_DEFAULT_THINKING ?? 1024);
 
+/**
+ * What a client may ask a generation to spend (M5).
+ *
+ * ⚠️ `/api/ai/generate` USED TO SPREAD `generationConfig` STRAIGHT THROUGH, so
+ * a subscriber chose `candidateCount`, `maxOutputTokens`, `thinkingBudget`,
+ * `responseModalities` — anything Gemini accepts. Thinking tokens bill as
+ * output, so those three between them set the bill.
+ *
+ * ⚠️ THE OUTPUT CAP IS THE LEVER, NOT THE THINKING ONE, which is worth knowing
+ * before anyone tunes these. At the standard `gemini-3.8-flash` rate of $7.50
+ * per million output tokens, 4,096 thinking + 32,768 output is $0.2765 a call
+ * — and the output half is 89% of it. Doubling the thinking cap to 8,192 moves
+ * the ceiling by 11%. A measured real `diet_generate` costs $0.0701, so this
+ * pair is a little under 4x a true call: headroom, not a straitjacket.
+ *
+ * 32,768 is the largest the client asks for (the diet main draft) and 4,096 is
+ * the largest thinking it asks for. Both are env-overridable so a future model
+ * needing more is a Railway variable rather than a deploy.
+ */
+const GEMINI_MAX_OUTPUT_TOKENS = envInt('GEMINI_MAX_OUTPUT_TOKENS', 32768, '[gemini]');
+const GEMINI_MAX_THINKING = envInt('GEMINI_MAX_THINKING', 4096, '[gemini]');
+
+/** The only two the client asks for, and the only two worth forwarding. */
+const ALLOWED_RESPONSE_MIME_TYPES = new Set(['application/json', 'text/plain']);
+
 // Asks Gemini to judge, from the REAL FatSecret candidates for one search,
 // which one (if any) is genuinely the same food as the ingredient - this is
 // the primary match-acceptance check, replacing word-overlap guessing with
@@ -2521,12 +2704,15 @@ app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), expre
      * A second, shorter timeout here would just truncate long (but healthy)
      * generations — a flash draft legitimately runs ~70s.
      */
-    /* The app's own thinkingConfig outranks the default — see
-       DEFAULT_THINKING_BUDGET. Built once, outside the retry, so the fallback
-       attempt sends exactly what the primary did. */
-    const effectiveConfig = { ...(generationConfig || {}) };
-    if (!effectiveConfig.thinkingConfig) {
-        effectiveConfig.thinkingConfig = { thinkingBudget: DEFAULT_THINKING_BUDGET, includeThoughts: false };
+    /* Whitelisted, clamped and bounded by `buildGenerationConfig` — see it for
+       why this is built from scratch rather than spread. Built once, outside
+       the retry, so the fallback attempt sends exactly what the primary did. */
+    const { config: effectiveConfig, warnings: configWarnings } = buildGenerationConfig(generationConfig);
+    /* One line per rejected key, naming the operation. Silent for every shape
+       the real client sends, so anything here is either abuse or a client
+       change nobody told the proxy about — both worth seeing in the log. */
+    for (const w of configWarnings) {
+        console.warn(`[gemini] ${req.userId} ${operationLabel ?? req.path} — ${w}`);
     }
 
     const callModel = async (modelName) => {
