@@ -5,8 +5,8 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Config Toggle: Set to true only if you purchase the $250/mo NLP add-on from FatSecret
-const USE_NATIVE_NLP = process.env.USE_NATIVE_NLP === 'true';
+/* USE_NATIVE_NLP and REQUIRE_SUBSCRIPTION are parsed with the other
+   environment values further down — see `envFlag`. */
 
 app.use(cors());
 
@@ -264,6 +264,74 @@ const envInt = (varName, fallback, announce) => {
 
 const limitFrom = (bucket, fallback) =>
     envInt(`AI_LIMIT_${bucket.toUpperCase()}`, fallback, '[ratelimit]');
+
+/**
+ * An exact boolean from the environment, or the SAFE side of the decision.
+ *
+ * ⚠️ THE RULE THIS ENCODES, AND IT IS WHY THE THREE THROWS IN THIS FILE ARE
+ * THROWS. Refuse to start when there is NO safe default: a monthly bucket with
+ * no hourly ceiling is unbounded whichever way you guess, an allow-list that
+ * silently shrank breaks a feature whichever way you guess, and a spend budget
+ * below one reservation refuses every call whichever way you guess. Nothing
+ * can be chosen, so nothing should start.
+ *
+ * A FLAG IS NOT LIKE THAT — it has a safe side — so an unrecognised value
+ * falls to it and says so. Exiting instead would trade a silent
+ * misconfiguration for a dead service: the same mistake, a worse answer, and
+ * no security gained, because after the inversion below no value of
+ * REQUIRE_SUBSCRIPTION except the exact string "false" can open the paywall.
+ *
+ * ⚠️ EXACT STRINGS ONLY: no trimming, no case-folding. `True`, `TRUE`, `1`,
+ * `yes`, `on` and `true ` with a trailing space are all the same mistake, and
+ * quietly accepting them teaches that the spelling does not matter — which is
+ * the belief that makes the NEXT flag dangerous, one that may have no safe
+ * side. The warn quotes the value so a trailing space is visible in the log.
+ */
+const envFlag = (varName, safeDefault) => {
+    const raw = process.env[varName];
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+    if (raw !== undefined) {
+        console.warn(
+            `[config] ${varName}="${raw}" is neither "true" nor "false" — using `
+            + `${safeDefault}, the safe side. Set it to exactly "true" or "false".`
+        );
+    }
+    return safeDefault;
+};
+
+/**
+ * ⚠️ DEFAULT ON, AND THE INVERSION IS THE WHOLE FIX (M2). This was
+ * `process.env.REQUIRE_SUBSCRIPTION !== 'true'`, so UNSET meant OPEN — a new
+ * Railway environment, a renamed variable, or a copied `.env` missing one line
+ * each shipped a free Gemini proxy whose only symptom was a boot line nobody
+ * reads unless something else has already gone wrong. All three now fail
+ * CLOSED. Opening the paywall takes the exact string "false", written on
+ * purpose, and the boot line announces it as a warning.
+ *
+ * ⚠️ ANYTHING THAT RELIED ON "UNSET MEANS OPEN" MUST NOW SAY SO EXPLICITLY,
+ * and that is the one behaviour change a deploy could be surprised by. A
+ * service with this variable absent starts ENFORCING.
+ *
+ * ⚠️ PARSED ONCE, AND EVERY READER USES THIS CONST. The middleware and the
+ * boot report each compared the raw string themselves, which the comment above
+ * the report admitted: "the test below must stay a mirror of the one in
+ * `requireSubscription` — if that one changes, this says the wrong thing
+ * confidently". A strict parser in one place and a raw `=== 'true'` in the
+ * other is exactly that drift, and it would have the server enforcing while
+ * the log said OFF. A second raw read is now a bug, not a discipline.
+ */
+const REQUIRE_SUBSCRIPTION = envFlag('REQUIRE_SUBSCRIPTION', true);
+
+/**
+ * The $250/mo FatSecret NLP add-on.
+ *
+ * ⚠️ ITS SAFE SIDE IS THE OPPOSITE OF THE PAYWALL'S, which is why `envFlag`
+ * takes the default per flag instead of having one. Turning this on without
+ * the add-on spends money nobody agreed to; leaving it off merely declines to
+ * use a feature we may have paid for. Off is the side to fall to.
+ */
+const USE_NATIVE_NLP = envFlag('USE_NATIVE_NLP', false);
 
 const AI_LIMITS = {
     /** Per calendar month — see MONTHLY_BUCKETS. */
@@ -1730,7 +1798,7 @@ const isEntitled = async (userId, token) => {
  */
 
 const requireSubscription = async (req, res, next) => {
-    if (process.env.REQUIRE_SUBSCRIPTION !== 'true') return next();
+    if (!REQUIRE_SUBSCRIPTION) return next();
 
     const header = req.headers.authorization || '';
     const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
@@ -4165,22 +4233,23 @@ app.listen(PORT, () => {
      * loaded, not what someone believes they set. That is how the limits were
      * confirmed to be on their defaults in production.
      *
-     * ⚠️ IT REPORTS, IT DOES NOT DECIDE. The test below must stay a mirror of
-     * the one in `requireSubscription` — if that one changes, this says the
-     * wrong thing confidently, which is worse than saying nothing.
+     * ⚠️ IT REPORTS, IT DOES NOT DECIDE — AND IT CAN NO LONGER DISAGREE. This
+     * used to compare the raw environment string itself, mirroring the test in
+     * `requireSubscription`, and the two had to be kept in step by hand. Both
+     * now read the same parsed const, so the line cannot say OFF while the
+     * middleware enforces.
+     *
+     * ⚠️ THE "SET BUT NOT THE EXACT STRING" BRANCH IS GONE BECAUSE IT CANNOT
+     * HAPPEN HERE ANY MORE. `envFlag` has already warned about such a value
+     * and fallen to enforcing, so by this point OFF means someone wrote
+     * "false" deliberately.
      */
-    const enforcing = process.env.REQUIRE_SUBSCRIPTION === 'true';
-    const raw = process.env.REQUIRE_SUBSCRIPTION;
-    if (enforcing) {
+    if (REQUIRE_SUBSCRIPTION) {
         console.log('[auth] subscription enforcement ON — paid operations require an active subscription');
-    } else if (raw !== undefined && raw !== '') {
-        /* Set, but not to the one value that counts. This is the failure the
-           line exists to catch, so it names what was found. */
+    } else {
         console.warn(
-            `[auth] subscription enforcement OFF — REQUIRE_SUBSCRIPTION="${raw}" is not the exact string "true". ` +
+            '[auth] subscription enforcement OFF — REQUIRE_SUBSCRIPTION="false". ' +
             'Every signed-in account may call paid operations.',
         );
-    } else {
-        console.warn('[auth] subscription enforcement OFF — every signed-in account may call paid operations');
     }
 });
