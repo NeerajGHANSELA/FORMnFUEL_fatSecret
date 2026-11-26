@@ -1873,11 +1873,34 @@ const isEntitled = async (userId, token) => {
         global: { headers: { Authorization: `Bearer ${token}` } },
     });
 
-    const read = scoped
+    /**
+     * ⚠️ `Promise.resolve` IS LOAD-BEARING: THE BUILDER IS A THENABLE, NOT A
+     * PROMISE. A postgrest-js builder runs its fetch EVERY TIME `.then` is
+     * called on it, and this function calls `.then` twice — once below for the
+     * late cache write, and once inside `Promise.race`, which attaches to each
+     * entry it is given. Without this wrapper every uncached entitlement check
+     * sent TWO identical `subscriptions` GETs in the same millisecond, and the
+     * raced promise was the second of them rather than the first, so the read
+     * budget was measured from a slightly later start. Measured: 2 fetches
+     * without it, 1 with. `Promise.resolve` adopts a thenable by calling its
+     * `then` exactly once, so both consumers below share one request.
+     *
+     * ⚠️ AND A STUB THAT RETURNS A PLAIN PROMISE CANNOT CATCH THIS. The
+     * harness that tested the cache counted one read per check and was right
+     * about its own stub: a `Promise` re-resolves to the same value, where a
+     * builder re-runs. Anything testing this function's read VOLUME has to go
+     * through a real client with a counting `fetch`.
+     *
+     * Third time in this file a name has not meant what it looked like, after
+     * `req.destroyed` ("body consumed", not "client gone") and `promptChars`
+     * (computed every call, enforcing nothing). A thing that awaits like a
+     * promise is not a promise.
+     */
+    const read = Promise.resolve(scoped
         .from('subscriptions')
         .select('status, expires_at')
         .eq('user_id', userId)
-        .maybeSingle();
+        .maybeSingle());
 
     /**
      * ⚠️ THE CACHE WRITE HANGS OFF THE READ, NOT OFF THE RACE. A read that
