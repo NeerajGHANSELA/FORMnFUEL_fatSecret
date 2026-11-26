@@ -4179,6 +4179,41 @@ const errorMessageFor = (status) => {
 };
 
 /**
+ * THE LAST TWO NON-JSON RESPONSES THIS SERVICE COULD PRODUCE.
+ *
+ * ⚠️ EXPRESS'S 404 IS AN HTML PAGE, and it was the only HTML the proxy
+ * served. Every other answer here is `{ error: { message } }`, which is the
+ * shape the app's `proxyError` parses — so an unknown path handed the client
+ * markup to read as JSON. Nothing requests an unknown path on purpose, which
+ * is exactly why this went unnoticed.
+ *
+ * ⚠️ AND OPTIONS NEEDS ITS OWN LINE, WHICH THE 404 CATCH-ALL DOES NOT COVER.
+ * Measured after `cors()` was removed: Express's router answers OPTIONS itself
+ * with 200, an `Allow` header and a `text/html` body listing the methods, and
+ * it never calls `next()`, so no `app.use` below it is ever reached. A
+ * catch-all alone would have left that HTML in place and the "no HTML
+ * anywhere" claim would have been false for one method.
+ *
+ * ⚠️ 404 RATHER THAN 405, DELIBERATELY, for a path that exists under another
+ * method. 405 is the more correct status and it comes with an `Allow` header
+ * enumerating what the path accepts — which is method enumeration handed to
+ * anyone who asks. A native-only API owes no one that list, and one answer for
+ * "nothing for you here" is easier to reason about than two.
+ *
+ * ⚠️ NOT LOGGED, ON PURPOSE. A 404 is what a scanner generates thousands of
+ * at a time, and a log line per miss is a free way to bury the lines that
+ * matter — the `[ratelimit]`, `[entitlement]` and `[error]` ones — under
+ * traffic an attacker chooses the volume of.
+ *
+ * ⚠️ BOTH MUST STAY BELOW EVERY ROUTE AND ABOVE THE ERROR HANDLER. Above a
+ * route, they would answer it. Below the error handler, Express would never
+ * reach them, since it is matched by arity rather than position.
+ */
+const notFound = (req, res) => res.status(404).json({ error: { message: 'Not found.' } });
+app.options('*', notFound);
+app.use(notFound);
+
+/**
  * The last word on any request that threw.
  *
  * ⚠️ REGISTERED AFTER EVERY ROUTE, which is the only position Express accepts
