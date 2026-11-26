@@ -2684,8 +2684,29 @@ app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), expre
      * The client giving up is the event worth catching, and it arrives as a
      * closed socket rather than an error. Registered BEFORE the await, or the
      * abort can land while we are still setting up and go unlogged.
+     *
+     * ⚠️ `res.on`, NOT `req.on`, AND THIS LINE WAS FALSE ON EVERY GENERATION
+     * UNTIL IT WAS CHANGED. The REQUEST stream closes as soon as its body has
+     * been consumed — which `express.json` does before this handler runs — so
+     * `req.on('close')` fired at 0ms on every call, `res.writableEnded` was
+     * naturally still false that early, and the log claimed "CLIENT ABORTED …
+     * This is the app's 180s deadline firing" about requests that went on to
+     * answer 200 a minute later. Measured, same request, both handlers
+     * attached:
+     *
+     *     connected, answers at 1200ms:  req fired at 0ms,  res never fired
+     *     client aborts at 400ms:        req fired at 0ms,  res fired at 405ms
+     *
+     * The RESPONSE stream closes when the socket does, which is the thing we
+     * mean. `!res.writableEnded` is what separates an abort from a normal
+     * finish, since `close` fires for both — on a completed request it lands
+     * after `finish`, with `writableEnded` true.
+     *
+     * This is the same trap the nutrition loops hit (see `aborted()` there),
+     * and it predates that work: anyone reading this log in production was
+     * being sent after a timeout that had not happened.
      */
-    req.on('close', () => {
+    res.on('close', () => {
         if (!res.writableEnded) {
             console.warn(
                 `[AI Proxy] CLIENT ABORTED after ${Date.now() - startedAt}ms — ` +
