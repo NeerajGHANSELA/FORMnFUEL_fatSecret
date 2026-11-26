@@ -1689,7 +1689,65 @@ const rateLimitAi = async (req, res, next) => {
  * afternoon. It is deliberately not tied to `expires_at`, which can be days
  * away and tells you nothing about a refund that happened ten seconds ago.
  */
-const ENTITLEMENT_TTL_MS = 60_000;
+const ENTITLEMENT_TTL_MS = envInt('ENTITLEMENT_TTL_MS', 60_000, '[entitlement]');
+
+/**
+ * How long a STALE answer may be served when the read cannot be completed.
+ *
+ * ⚠️ ONE HOUR, AND THE ARITHMETIC MATTERS BECAUSE OF WHAT ELSE FAILS AT THE
+ * SAME TIME. Serving a stale `true` is what keeps a paying customer working
+ * through an outage, but it also extends the window above — the one that
+ * paragraph calls "a free afternoon" at an hour. During a Supabase outage the
+ * monthly spend budget does NOT bound that window either: its seed reads
+ * `ai_usage` from the same database, fails, and fails open by design. So the
+ * only live bound on a stale-true user is the in-memory hourly buckets: 120
+ * machinery calls an hour at roughly $0.34 a maxed call, about $40 an hour.
+ * One hour is ~$40 of worst-case exposure; a day would be ~$980.
+ *
+ * ⚠️ AND A LONGER CEILING BUYS LESS THAN IT LOOKS. In a genuinely prolonged
+ * outage the app cannot save a generated plan anyway, because plan writes go
+ * to the same database. The failure this actually covers is a TRANSIENT
+ * proxy-side read error, which an hour covers completely.
+ *
+ * The override exists for the same reason `AI_LIMIT_*` does — so a rig can
+ * test the real code path instead of a copy of it — and is clamped, because a
+ * generous value left here would widen the free-spend window silently. A value
+ * BELOW the TTL is safe and needs no check: entries younger than the TTL are
+ * served fresh, so a smaller ceiling simply turns stale-serving off.
+ */
+const ENTITLEMENT_STALE_HARD_MAX_MS = 4 * 60 * 60_000;
+const entitlementStaleRequested = envInt('ENTITLEMENT_STALE_MAX_MS', 60 * 60_000, '[entitlement]');
+const ENTITLEMENT_STALE_MAX_MS = Math.min(entitlementStaleRequested, ENTITLEMENT_STALE_HARD_MAX_MS);
+if (entitlementStaleRequested > ENTITLEMENT_STALE_HARD_MAX_MS) {
+    console.warn(
+        `[entitlement] ENTITLEMENT_STALE_MAX_MS=${entitlementStaleRequested} exceeds the `
+        + `${ENTITLEMENT_STALE_HARD_MAX_MS}ms ceiling — using the ceiling`
+    );
+}
+
+/**
+ * How long the read itself may take before it counts as unknown.
+ *
+ * ⚠️ THIS EXISTS BECAUSE THE CLIENT LIBRARY RETRIES FOUR TIMES AND NOTHING
+ * PASSED INTO IT BOUNDS THAT. Measured against a black-hole IP with
+ * supabase-js / postgrest 2.111.0: fetch is invoked at 12ms, 2218ms, 5420ms
+ * and 10625ms — 11.8s in total. An `AbortSignal.timeout(1200)` per attempt
+ * still took 11.8s; ONE shared signal across the retries took 8.5s for a
+ * 1.5s budget and 10.0s for a 3s budget, because postgrest waits out its
+ * backoff even with an already-aborted signal. Only racing the AWAITED
+ * promise bounds it: 3012ms for a 3s budget.
+ *
+ * ⚠️ WITHOUT IT THE WHOLE FALLBACK BELOW IS UNREACHABLE IN PRACTICE. A
+ * cached answer served twelve seconds into every paid call is not a fallback:
+ * the app's own deadlines fire on many of those requests first, so it would
+ * pass a stub test and do nothing in a real outage. That twelve seconds is
+ * also what today's code spends before answering 402.
+ */
+const ENTITLEMENT_READ_BUDGET_MS = envInt('ENTITLEMENT_READ_BUDGET_MS', 3_000, '[entitlement]');
+
+/** Returned by the race when the read did not finish in its budget. */
+const ENTITLEMENT_TIMED_OUT = Symbol('entitlement-read-timed-out');
+
 const entitlementCache = new Map();
 
 /**
@@ -1707,28 +1765,110 @@ const entitlementCache = new Map();
  * policy in the database if the proxy were ever compromised. Least privilege
  * costs nothing here.
  */
+/**
+ * The last answer we actually verified, when the read cannot be completed.
+ *
+ * ⚠️ A STALE `true` IS SERVED; A STALE `false` IS NOT. Both outcomes REFUSE
+ * the user, so serving a stale false protects nothing — and it costs exactly
+ * the false claim this whole change exists to remove, telling someone who
+ * subscribed an hour ago that they have no subscription. Unknown is the honest
+ * answer, and the caller turns it into 503.
+ *
+ * ⚠️ THE CACHE IS RE-READ HERE rather than taken from the caller. A read
+ * that landed late from an earlier request may have refreshed it in the
+ * meantime, and that answer is better than the one this request started with.
+ */
+const entitlementFromCache = (userId, reason) => {
+    const cached = entitlementCache.get(userId);
+    const ageMs = cached ? Date.now() - cached.at : null;
+    if (cached && cached.ok && ageMs <= ENTITLEMENT_STALE_MAX_MS) {
+        console.warn(
+            `[entitlement] ${userId} read failed (${reason}) — `
+            + `serving answer from ${Math.round(ageMs / 1000)}s ago`
+        );
+        return { known: true, ok: true, stale: true };
+    }
+    console.warn(`[entitlement] ${userId} read failed (${reason}) — no usable cached answer, 503`);
+    return { known: false, ok: false };
+};
+
+/**
+ * Does this row mean entitled? Extracted because the late cache write below
+ * needs the same answer as the request that raced it, and two copies of this
+ * rule would drift — there are already three copies across the codebase.
+ */
+const entitledFromRow = (data) => (
+    !data ? false
+        : data.status === 'expired' ? false
+            : data.status === 'cancelled'
+                ? (!!data.expires_at && new Date(data.expires_at).getTime() > Date.now())
+                : ['active', 'trialing', 'grace'].includes(data.status)
+);
+
 const isEntitled = async (userId, token) => {
     const cached = entitlementCache.get(userId);
-    if (cached && cached.at > Date.now() - ENTITLEMENT_TTL_MS) return cached.ok;
+    if (cached && cached.at > Date.now() - ENTITLEMENT_TTL_MS) return { known: true, ok: cached.ok };
 
     const scoped = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
         auth: { persistSession: false, autoRefreshToken: false },
         global: { headers: { Authorization: `Bearer ${token}` } },
     });
 
-    const { data, error } = await scoped
+    const read = scoped
         .from('subscriptions')
         .select('status, expires_at')
         .eq('user_id', userId)
         .maybeSingle();
 
-    // ⚠️ AN ERROR IS NOT A YES. A failed read looks exactly like a missing row,
-    // and treating "cannot tell" as entitled would hand the paid tier to anyone
-    // who can make a query fail. Not cached either — the next call retries.
-    if (error) {
-        console.warn('[entitlement] read failed:', error.message);
-        return false;
+    /**
+     * ⚠️ THE CACHE WRITE HANGS OFF THE READ, NOT OFF THE RACE. A read that
+     * lands after its budget still refreshes the answer, so the next call
+     * within the TTL is served FRESH rather than stale. Costs nothing: the
+     * request is already in flight and it is a GET.
+     *
+     * A late ERROR stays uncached, which is the existing rule — caching a
+     * failure would turn one bad read into a minute of them.
+     *
+     * The `.catch` is belt and braces: measured, postgrest RETURNS a network
+     * failure as `error` rather than throwing, which is also why abandoning
+     * this promise is safe and leaves no unhandled rejection.
+     */
+    read.then((settled) => {
+        if (!settled || settled.error) return;
+        entitlementCache.set(userId, { ok: entitledFromRow(settled.data), at: Date.now() });
+    }).catch(() => {});
+
+    const settled = await Promise.race([
+        read,
+        new Promise((resolve) => {
+            const timer = setTimeout(() => resolve(ENTITLEMENT_TIMED_OUT), ENTITLEMENT_READ_BUDGET_MS);
+            if (timer.unref) timer.unref();
+        }),
+    ]);
+
+    if (settled === ENTITLEMENT_TIMED_OUT) {
+        return entitlementFromCache(userId, `read exceeded ${ENTITLEMENT_READ_BUDGET_MS}ms`);
     }
+
+    const { data, error } = settled;
+
+    /**
+     * ⚠️ AN ERROR IS NOT A YES, AND IT IS NOT A NO EITHER. A failed read looks
+     * exactly like a missing row; treating "cannot tell" as entitled would hand
+     * the paid tier to anyone who can make a query fail, and treating it as NOT
+     * entitled told every paying customer they had no subscription for as long
+     * as the database was unreachable. It is now unknown, and unknown either
+     * serves the last verified `true` or answers 503.
+     *
+     * ⚠️ AND THIS DOES NOT CATCH THE MOST LIKELY SILENT FAILURE. `subscriptions`
+     * has exactly ONE policy — `SELECT (auth.uid() = user_id)`. If it is dropped,
+     * renamed or edited wrongly the read returns ZERO ROWS WITH NO ERROR, which
+     * is indistinguishable from "this user never subscribed": `known: true`,
+     * `ok: false`, 402 for every customer, and not one 503 anywhere to say so.
+     * The same shape as the write-side rule that an RLS-blocked statement
+     * reports success with zero rows. Do not read the 503 path as covering it.
+     */
+    if (error) return entitlementFromCache(userId, error.message);
 
     /**
      * ⚠️ THE STATUS DECIDES; THE DATE IS ASKED ONLY WHERE THE STATUS MEANS
@@ -1755,14 +1895,9 @@ const isEntitled = async (userId, token) => {
      * have to be changed together or the proxy refuses to generate for
      * someone the app is showing a plan to.
      */
-    const ok = !data ? false
-        : data.status === 'expired' ? false
-            : data.status === 'cancelled'
-                ? (!!data.expires_at && new Date(data.expires_at).getTime() > Date.now())
-                : ['active', 'trialing', 'grace'].includes(data.status);
-
+    const ok = entitledFromRow(data);
     entitlementCache.set(userId, { ok, at: Date.now() });
-    return ok;
+    return { known: true, ok };
 };
 
 /**
@@ -1836,7 +1971,8 @@ const requireSubscription = async (req, res, next) => {
     const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
     if (!token) return res.status(401).json({ error: { message: 'Missing bearer token.' } });
 
-    if (await isEntitled(req.userId, token)) return next();
+    const verdict = await isEntitled(req.userId, token);
+    if (verdict.known && verdict.ok) return next();
 
     /* Names the operation, so an addition that should have been free shows up
        in the logs as itself rather than as a vague refusal.
@@ -1856,6 +1992,32 @@ const requireSubscription = async (req, res, next) => {
        the answer is the client sending the operation in a HEADER, which is
        readable before any body — not moving the parser back. */
     const label = typeof req.body?.operation === 'string' ? req.body.operation : null;
+
+    /**
+     * ⚠️ UNKNOWN IS 503, NEVER 402, AND THAT IS THE WHOLE POINT OF THE
+     * TRI-STATE. `isEntitled` used to return a bare boolean, so an unreadable
+     * `subscriptions` row and a genuinely absent one were the same answer:
+     * during a database outage every paying customer was told they had no
+     * subscription and the app opened the paywall at them. 402 asserts a fact
+     * about their account; we do not have that fact here.
+     *
+     * ⚠️ IT NEEDS NO CLIENT CHANGE AND THAT IS NOT LUCK — checked.
+     * `proxyError` maps 503 to a plain Error, not `subscriptionRequiredError`,
+     * so none of the call sites that branch on `isSubscriptionRequiredError`
+     * can open the paywall on this. The symmetric fix on the auth path
+     * (484f6f3) already relies on the same mapping.
+     *
+     * ⚠️ THE CACHE IS IN MEMORY, SO A FRESH DEPLOY HAS NOTHING TO SERVE. An
+     * outage in the minutes after a restart answers 503 across the whole paid
+     * surface rather than serving a stale `true`, because no answer has been
+     * verified yet. That is honest and it is the same class of caveat as
+     * `aiHits` and the monthly spend accumulator.
+     */
+    if (!verdict.known) {
+        console.warn(`[entitlement] ${req.userId} could not verify ${label ?? req.path} — answering 503`);
+        return res.status(503).json({ error: { message: 'Could not verify subscription.' } });
+    }
+
     console.warn(`[entitlement] ${req.userId} refused ${label ?? req.path}: no active subscription`);
     return res.status(402).json({
         error: {
