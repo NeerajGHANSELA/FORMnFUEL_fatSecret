@@ -846,17 +846,21 @@ const PROMPT_UNIT_DIVISOR = 5;
 const MONTHLY_UNIT_BUDGET = limitFrom('monthly_spend', 500000);
 
 /**
- * ⚠️ ONE EXPRESSION FOR EVERY UNTRUSTED NUMBER OUT OF `ai_usage`. The table's
- * RLS allows INSERT-own, the four token columns are plain `integer NOT NULL
- * DEFAULT 0` with no CHECK, and a user can therefore insert rows under their
- * own id with NEGATIVE counts to lower any sum computed from it. Clamping per
- * ROW rather than on the total is what makes that useless: a negative row
- * contributes zero instead of subtracting. `Number.isFinite` covers null,
- * undefined and NaN in the same test, so a column that is not what the schema
- * promises cannot poison the sum either.
+ * ⚠️ ONE EXPRESSION FOR EVERY UNTRUSTED NUMBER OUT OF `ai_usage`. RLS allows
+ * INSERT-own, so a user can write rows under their own id — and when this was
+ * written the four token columns were plain `integer NOT NULL DEFAULT 0` with
+ * no CHECK, which let them insert NEGATIVE counts to lower any sum computed
+ * from the table. Clamping per ROW rather than on the total is what makes that
+ * useless: a negative row contributes zero instead of subtracting.
  *
- * A DB-level CHECK is the right home for this and is a follow-up outside this
- * repo; the clamp defends regardless of whether that ever lands.
+ * ⚠️ THE DATABASE NOW ENFORCES IT TOO, AND THAT IS NOT A REASON TO DELETE
+ * THIS. Migration `ai_usage_token_counts_non_negative` (2026-11-26) adds a
+ * validated CHECK that all four token columns are >= 0 and `elapsed_ms` is
+ * null or >= 0, so a negative insert fails with 23514. But a CHECK constrains
+ * COLUMNS, and this function guards the JSON that comes back over HTTP: it is
+ * `Number.isFinite` that covers a null, a missing key, a string or a NaN in
+ * the response body, none of which a column constraint can speak to. The two
+ * defend different surfaces — keep both.
  */
 const nonNegative = (v) => (Number.isFinite(v) && v > 0 ? v : 0);
 
