@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('node:crypto');
 require('dotenv').config();
 
 const app = express();
@@ -3252,6 +3253,38 @@ const DEEP_PROBE_TTL_MS = 60_000;
  * "is the nutrition service actually working" becomes a question with an
  * answer rather than an inference.
  */
+/**
+ * The secret that unlocks /health's detail and its deep probe (L3).
+ *
+ * ⚠️ AN UNSET OR EMPTY VALUE MEANS "NO SECRET CONFIGURED", NOT "THE SECRET
+ * IS THE EMPTY STRING". Without this the `||` below would compare an absent
+ * header against an absent token, both empty, and every stranger would be
+ * authorised — the exact shape of M2's old default, in a different place.
+ */
+const HEALTH_TOKEN = process.env.HEALTH_TOKEN || '';
+
+/**
+ * ⚠️ HASHED BEFORE COMPARING, SO LENGTHS ALWAYS MATCH. `timingSafeEqual`
+ * THROWS `ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH` on unequal-length buffers
+ * (measured) — which would both leak the token's length through the
+ * difference between an error and a false, and put an exception path on a
+ * public route. Two sha256 digests are always 32 bytes, so a header of any
+ * shape compares in constant time and nothing throws.
+ *
+ * ⚠️ A TIMING ATTACK HERE IS NOT REALISTIC and that is not why this is
+ * constant-time. It is the same reasoning that refused to accept `'True'` for
+ * a boolean flag: a secret compared with `===` is a pattern that gets copied
+ * to somewhere it matters.
+ */
+const sha256 = (value) => crypto.createHash('sha256').update(String(value), 'utf8').digest();
+
+const healthDetailAuthorised = (req) => {
+    if (!HEALTH_TOKEN) return false;
+    const presented = req.get('X-Health-Token');
+    if (typeof presented !== 'string' || presented === '') return false;
+    return crypto.timingSafeEqual(sha256(presented), sha256(HEALTH_TOKEN));
+};
+
 app.get('/health', wrap(async (req, res) => {
     /**
      * ⚠️ THE SHALLOW ANSWER NOW REFLECTS REAL TRAFFIC, which is the whole point.
@@ -3267,9 +3300,45 @@ app.get('/health', wrap(async (req, res) => {
      * directly; use this to notice.
      */
     const degraded = serviceIsDegraded();
-    const body = {
+
+    /**
+     * WHAT A STRANGER GETS (L3). `status` and `uptime`, nothing else.
+     *
+     * ⚠️ `status` STAYS PUBLIC AND KEEPS ITS DEGRADED LOGIC. It is not config
+     * detail to be trimmed later — it is the whole value of an unauthenticated
+     * health endpoint, and the note above explains what it cost when it was a
+     * hardcoded "ok". An uptime monitor must be able to see an outage without a
+     * secret.
+     *
+     * ⚠️ `deep` IS ALWAYS PRESENT AND IS TRUE ONLY IF A PROBE ACTUALLY RAN.
+     * `?deep=1` without the token is ignored rather than refused, so that a
+     * stranger learns nothing — but ignoring it SILENTLY would make "the probe
+     * passed" and "the probe never ran" the same response to the person
+     * reading it at two in the morning. A cache hit counts as true: a probe did
+     * run, and `fatSecret.cached` says how recently.
+     */
+    const publicBody = {
         status: degraded ? "degraded" : "ok",
         uptime: process.uptime(),
+        deep: false,
+    };
+
+    /**
+     * ⚠️ EVERYTHING BELOW IS BEHIND THE TOKEN, AND THE PROBE IS WHY. `?deep=1`
+     * made a real FatSecret `foods.search` call for anyone on the internet —
+     * throttled to one per DEEP_PROBE_TTL_MS, so bounded rather than nothing,
+     * but still our quota spent by a stranger. `fatSecretLastFailure` is the
+     * other half: it publishes upstream error TEXT, which is the one field here
+     * that could carry internal detail.
+     *
+     * The rest (`nativeNlpMode`, the config booleans, the cache sizes) is not
+     * sensitive on its own; it moves because there is no reason for a stranger
+     * to have it and because open CORS used to let any page read all of it.
+     */
+    if (!healthDetailAuthorised(req)) return res.json(publicBody);
+
+    const body = {
+        ...publicBody,
         nativeNlpMode: USE_NATIVE_NLP,
         config: {
             hasClientId: !!process.env.FATSECRET_CLIENT_ID,
@@ -3295,6 +3364,7 @@ app.get('/health', wrap(async (req, res) => {
     if (lastDeepProbe && Date.now() - lastDeepProbe.at < DEEP_PROBE_TTL_MS) {
         return res.json({
             ...body,
+            deep: true,
             status: lastDeepProbe.result.ok && !degraded ? 'ok' : 'degraded',
             fatSecret: { ...lastDeepProbe.result, cached: true },
         });
@@ -3340,7 +3410,7 @@ app.get('/health', wrap(async (req, res) => {
     // A fresh probe can clear its own doubt but not traffic's — see above. If the
     // probe passes while lookups are being refused, something is wrong that a
     // single "chicken breast" query does not reach, and "ok" would be a lie.
-    return res.json({ ...body, status: result.ok && !degraded ? 'ok' : 'degraded', fatSecret: result });
+    return res.json({ ...body, deep: true, status: result.ok && !degraded ? 'ok' : 'degraded', fatSecret: result });
 }));
 
 // ---------------------------------------------------------------------------
@@ -4319,6 +4389,15 @@ app.listen(PORT, () => {
      * and fallen to enforcing, so by this point OFF means someone wrote
      * "false" deliberately.
      */
+    /* Same posture as the line below: the only thing that reports the real
+       mode is the process saying so. Without this, losing the deep probe looks
+       like the probe being broken rather than unconfigured. */
+    if (HEALTH_TOKEN) {
+        console.log('[health] HEALTH_TOKEN set — /health detail and ?deep=1 require the X-Health-Token header');
+    } else {
+        console.warn('[health] HEALTH_TOKEN unset — /health serves status and uptime only, and ?deep=1 is ignored');
+    }
+
     if (REQUIRE_SUBSCRIPTION) {
         console.log('[auth] subscription enforcement ON — paid operations require an active subscription');
     } else {
