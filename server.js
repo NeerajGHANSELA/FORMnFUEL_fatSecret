@@ -1692,6 +1692,57 @@ const rateLimitAi = async (req, res, next) => {
 const ENTITLEMENT_TTL_MS = envInt('ENTITLEMENT_TTL_MS', 60_000, '[entitlement]');
 
 /**
+ * How long a cached NO may be reused — seconds, where a yes gets a minute.
+ *
+ * ⚠️ THE ASYMMETRY IS THE POINT, BECAUSE ONLY ONE OF THE TWO CAN DENY
+ * SOMEONE WHO HAS PAID. A cached `false` outlives the moment it stops being
+ * true: the row flips when the RevenueCat webhook lands — measured at 4.5s on
+ * a real Play purchase, in `app/unlocking.tsx`'s own note — and until this
+ * cache lets go, that user is refused with an active subscription sitting in
+ * the table. A cached `true` costs at most the window the note above
+ * describes, which is a trade already made deliberately.
+ *
+ * ⚠️ NO TRACED CLIENT FLOW ACTUALLY REACHED THE OLD 60s WINDOW, and it is
+ * still wrong. Every 402 `replace`s the user out to the plan picker, the
+ * post-purchase screen polls Supabase DIRECTLY rather than through this proxy,
+ * and every route out of it lands on the quiz or the plan review rather than
+ * on another paid call — so the shortest real path from a 402 to the next
+ * proxy request runs to minutes. That is a coincidence of durations, not a
+ * guarantee, and the rule it was protecting is absolute: nobody who has paid
+ * may be denied Coach.
+ *
+ * ⚠️ FIVE SECONDS, NOT ZERO. One diet generation is several paid requests —
+ * `fetchGeminiWithRetry` in DietSetupFlow makes four of the heaviest calls on
+ * a raw fetch outside `proxyFetchOnce` — and a Core user can hold a paid
+ * button down. Uncached, each of those is its own `subscriptions` read; at 5s
+ * they collapse to one. Five is already under the webhook latency the client
+ * polls through, so going lower buys the rule nothing.
+ */
+const entitlementNegativeRequested = envInt('ENTITLEMENT_NEGATIVE_TTL_MS', 5_000, '[entitlement]');
+
+/**
+ * ⚠️ A NO MAY NEVER OUTLIVE A YES. Setting the negative TTL above the
+ * positive one inverts the whole reason this exists — it would hold a refusal
+ * LONGER than an approval — and that is the bug being fixed, reintroduced
+ * through configuration. There is a safe side, so it clamps rather than
+ * throwing, per the rule above `envFlag`.
+ */
+const ENTITLEMENT_NEGATIVE_TTL_MS = Math.min(entitlementNegativeRequested, ENTITLEMENT_TTL_MS);
+if (entitlementNegativeRequested > ENTITLEMENT_TTL_MS) {
+    console.warn(
+        `[entitlement] ENTITLEMENT_NEGATIVE_TTL_MS=${entitlementNegativeRequested} exceeds `
+        + `ENTITLEMENT_TTL_MS=${ENTITLEMENT_TTL_MS} — a refusal must not outlive an approval; using the smaller`
+    );
+}
+
+/**
+ * Which TTL governs this entry. Branched at READ time rather than stored on
+ * the entry, so one constant decides and a cache written before an override
+ * cannot carry the old number.
+ */
+const entitlementTtlFor = (ok) => (ok ? ENTITLEMENT_TTL_MS : ENTITLEMENT_NEGATIVE_TTL_MS);
+
+/**
  * How long a STALE answer may be served when the read cannot be completed.
  *
  * ⚠️ ONE HOUR, AND THE ARITHMETIC MATTERS BECAUSE OF WHAT ELSE FAILS AT THE
@@ -1807,7 +1858,15 @@ const entitledFromRow = (data) => (
 
 const isEntitled = async (userId, token) => {
     const cached = entitlementCache.get(userId);
-    if (cached && cached.at > Date.now() - ENTITLEMENT_TTL_MS) return { known: true, ok: cached.ok };
+    if (cached && cached.at > Date.now() - entitlementTtlFor(cached.ok)) {
+        return { known: true, ok: cached.ok };
+    }
+
+    /* ⚠️ AN EXPIRED NO FALLS THROUGH TO A FRESH READ, NEVER TO THE STALE PATH.
+       That holds by construction rather than by a check here:
+       `entitlementFromCache` serves only `cached.ok === true`, so a false that
+       has aged out cannot be served by it — a read failure on top of one
+       answers 503. Keep that property if either side is touched. */
 
     const scoped = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
         auth: { persistSession: false, autoRefreshToken: false },
