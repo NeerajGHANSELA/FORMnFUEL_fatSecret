@@ -2916,10 +2916,17 @@ Respond with ONLY the number of the correct entry, or 0 if none are correct. No 
     const timeoutId = setTimeout(() => controller.abort(), 15000);
     try {
         const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${MATCH_MODEL}:generateContent?key=${apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${MATCH_MODEL}:generateContent`,
             {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                /* ⚠️ THE KEY TRAVELS AS A HEADER, NOT IN THE QUERY STRING (L1).
+                   Google accepts either on this endpoint. A query string is the
+                   copy of the URL that intermediaries, proxies and Google's own
+                   access logs keep, and it survives in shell history and crash
+                   reports. Nothing in THIS file logs a URL — checked, not
+                   assumed — so this fixes no observed leak; it removes the
+                   class, so the next log line someone adds cannot create one. */
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
                 body: JSON.stringify({
                     contents: [{ parts: [{ text: prompt }] }],
                     generationConfig: {
@@ -2976,10 +2983,11 @@ Using standard nutrition data for this food, respond with ONLY the protein, carb
     let text;
     try {
         const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${ESTIMATE_MODEL}:generateContent?key=${apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${ESTIMATE_MODEL}:generateContent`,
             {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                /* Key as a header, not a query param — see the note at the match call. */
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
                 body: JSON.stringify({
                     contents: [{ parts: [{ text: prompt }] }],
                     generationConfig: {
@@ -3449,10 +3457,11 @@ app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), expre
     const callModel = async (modelName) => {
         const attemptStart = Date.now();
         const geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`,
             {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                /* Key as a header, not a query param — see the note at the match call. */
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
                 body: JSON.stringify({ contents, generationConfig: effectiveConfig }),
             }
         );
