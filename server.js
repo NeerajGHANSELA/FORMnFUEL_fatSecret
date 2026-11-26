@@ -470,6 +470,39 @@ const MACHINERY_OPERATIONS = new Set([
 
 const KNOWN_OPERATIONS = new Set([...Object.keys(AI_BUCKETS), ...MACHINERY_OPERATIONS]);
 
+/**
+ * ⚠️ TWO BOOT CHECKS, AND THEY GUARD DIFFERENT THINGS.
+ *
+ * The first is an INVARIANT: every bucket a label maps to must have a limit.
+ * Nothing checked this before, and a typo in an `AI_BUCKETS` value resolves
+ * `AI_LIMITS[bucket]` to `undefined`, which makes `takeAiToken`'s comparisons
+ * meaningless rather than strict — a limiter that silently stops limiting,
+ * which is the one outcome it may never produce. This is the same shape as the
+ * `HOURLY_FOR_MONTHLY` check above and fails only on a real mistake.
+ *
+ * The second is a TRIPWIRE, not an invariant: the count is a literal, so
+ * adding a seventeenth label legitimately means bumping it here. That is the
+ * point. The set is DERIVED, so a restructuring of `AI_BUCKETS` could shrink
+ * it without touching this file's label lists, and a silently shorter
+ * allow-list 400s a working feature. Growth is the more dangerous direction
+ * — an extra member admits a label nobody vetted — and a count is the only
+ * cheap check that sees either. Bump it deliberately; do not delete it.
+ */
+for (const [label, bucket] of Object.entries(AI_BUCKETS)) {
+    if (AI_LIMITS[bucket] === undefined) {
+        throw new Error(`[ratelimit] operation '${label}' maps to bucket '${bucket}', which has no entry in AI_LIMITS`);
+    }
+}
+
+const EXPECTED_OPERATION_COUNT = 16;
+if (KNOWN_OPERATIONS.size !== EXPECTED_OPERATION_COUNT) {
+    throw new Error(
+        `[ratelimit] KNOWN_OPERATIONS has ${KNOWN_OPERATIONS.size} labels, expected ${EXPECTED_OPERATION_COUNT}. `
+        + 'If a label was added or removed on purpose, update EXPECTED_OPERATION_COUNT; otherwise something '
+        + 'restructured AI_BUCKETS or MACHINERY_OPERATIONS and the allow-list no longer matches the client.'
+    );
+}
+
 
 /**
  * How close two generate calls must be to count as ONE.
