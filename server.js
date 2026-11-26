@@ -352,7 +352,27 @@ const AI_LIMITS = {
      * act of pricing a meal; separate allowances would let the pair cost double
      * what either admits to.
      */
-    nutrition: limitFrom('nutrition', 200),
+    /**
+     * ⚠️ THIS BUCKET COUNTS INGREDIENTS. Every other entry here counts
+     * REQUESTS, and that difference is the whole of H3: these two routes were
+     * metered per request at 200/hour while the work they do scales with the
+     * ARRAY — up to three FatSecret searches, a Gemini match call and a
+     * food.get per ingredient on /analyze, and a Gemini call per ingredient on
+     * /estimate. A single legal 100 KiB body holds about 13,000 short names,
+     * so 200 requests an hour authorised roughly 18 million upstream calls.
+     *
+     * 1,500 an hour is about thirteen full plans — a plan verifies around 115
+     * ingredients — which no real user approaches; the client sends one meal
+     * per request, a handful of strings each.
+     *
+     * ⚠️ `X-RateLimit-Remaining` FOR THIS BUCKET IS THEREFORE IN INGREDIENTS.
+     * Checked before changing it: `useAiAllowance` is only ever called for
+     * `workout_swap` and `diet_swap`, so no screen displays this number, and
+     * `rateLimitCopy`'s fallback sentence never names a unit. If anything ever
+     * does read it, that sentence has to be written before this bucket can be
+     * shown.
+     */
+    nutrition: limitFrom('nutrition', 1500),
 };
 
 /**
@@ -458,7 +478,7 @@ setInterval(() => {
  * deliberate timing, caps out at roughly double for one burst, and is what a
  * sliding window would fix if the logs ever show someone riding it.
  */
-const takeAiToken = (userId, bucket, scope = null) => {
+const takeAiToken = (userId, bucket, scope = null, cost = 1) => {
     const limit = AI_LIMITS[bucket];
     /**
      * An unknown bucket must never fail open into an uncounted free pass —
@@ -489,22 +509,42 @@ const takeAiToken = (userId, bucket, scope = null) => {
     const now = Date.now();
     const hit = aiHits.get(key);
 
-    if (!hit || hit.resetAt <= now) {
-        aiHits.set(key, { count: 1, resetAt: now + windowMs });
-        return { ok: true, remaining: limit - 1, retryAfterSec: 0 };
+    /**
+     * ⚠️ ALL OR NOTHING, NEVER A PARTIAL TAKE. A request costing 60 against 40
+     * remaining must be refused having spent ZERO — spending the 40 and then
+     * refusing charges the caller for work that never happened and empties the
+     * window on their way out. Same reason `cost > limit` refuses outright: a
+     * request bigger than the whole budget can never be served, so letting it
+     * drain the bucket on every attempt would be a denial of service against
+     * the account rather than a limit on it.
+     *
+     * ⚠️ `cost` DEFAULTS TO 1, which is every other caller. Only the nutrition
+     * bucket passes anything else — see AI_LIMITS.nutrition for why that one
+     * counts ingredients rather than requests.
+     */
+    if (cost > limit) {
+        return { ok: false, remaining: Math.max(0, limit - (hit?.count ?? 0)), retryAfterSec: Math.ceil(windowMs / 1000) };
     }
 
-    if (hit.count >= limit) {
+    if (!hit || hit.resetAt <= now) {
+        aiHits.set(key, { count: cost, resetAt: now + windowMs });
+        return { ok: true, remaining: limit - cost, retryAfterSec: 0 };
+    }
+
+    if (hit.count + cost > limit) {
         return {
             ok: false,
-            remaining: 0,
+            /* The TRUE remainder, not 0 — with a cost above 1 the bucket can
+               refuse while still holding headroom, and reporting 0 there would
+               be a lie the client acts on. */
+            remaining: Math.max(0, limit - hit.count),
             // Rounded UP: a client that retries on the second the window
             // expires races it and gets a second refusal.
             retryAfterSec: Math.max(1, Math.ceil((hit.resetAt - now) / 1000)),
         };
     }
 
-    hit.count += 1;
+    hit.count += cost;
     return { ok: true, remaining: limit - hit.count, retryAfterSec: 0 };
 };
 
@@ -621,8 +661,18 @@ const sendRateLimited = (req, res, { bucket, label, window, retryAfterSec, extra
  * PATH rather than from a body field. `rateLimitAi` cannot serve these: it
  * reads `req.body.operation` to choose, and these routes have no such field.
  */
-const rateLimitFixed = (bucket) => (req, res, next) => {
-    const { ok, remaining, retryAfterSec } = takeAiToken(req.userId, bucket);
+/**
+ * @param costOf optional `(req) => number`. Omitted, every request costs 1,
+ *               which is what "fixed" meant when this only served one shape.
+ *               The nutrition routes pass the INGREDIENT count, because that
+ *               is what the request actually spends upstream — see
+ *               `validateIngredients`, which computes it before this runs so
+ *               that a request this limiter would reject has already been
+ *               rejected for being malformed, and never charges for it.
+ */
+const rateLimitFixed = (bucket, costOf) => (req, res, next) => {
+    const cost = costOf ? costOf(req) : 1;
+    const { ok, remaining, retryAfterSec } = takeAiToken(req.userId, bucket, null, cost);
     res.setHeader('X-RateLimit-Bucket', bucket);
     res.setHeader('X-RateLimit-Window', 'hour');
     res.setHeader('X-RateLimit-Remaining', String(remaining));
@@ -2533,6 +2583,89 @@ app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), expre
 }));
 
 /**
+ * What a nutrition request may ask for, and what it costs — decided ONCE,
+ * before the limiter, for both routes.
+ *
+ * ⚠️ IT RUNS BEFORE `rateLimitFixed`, AND THE ORDER IS THE POINT. The first
+ * shape of this fix put the caps in the handlers and the metering in the
+ * limiter, which runs first — so a 13,000-ingredient body would have spent
+ * 13,000 tokens from a 1,500/hour budget and THEN been refused as malformed.
+ * One bad request would have emptied a subscriber's hour at no cost to
+ * whoever sent it: a denial of service built out of a rate limiter. A request
+ * that is going to be rejected must be rejected before it is charged.
+ *
+ * ⚠️ IT ALSO PAIRS AND CLEANS, which is not scope creep — both handlers
+ * carried identical copies of these type checks AND of the pairing below, and
+ * the cost has to be computed from the SAME filtering the loop will do or the
+ * charge and the work drift apart. One filter, used by both.
+ *
+ * ⚠️ THE COST IS THE NON-BLANK COUNT. Both loops skip blank strings, so sixty
+ * blanks do no upstream work and are charged nothing. A cost of 0 passes the
+ * limiter deliberately — see takeAiToken.
+ */
+const MAX_INGREDIENTS = 60;
+const MAX_INGREDIENT_CHARS = 200;
+
+const validateIngredients = (req, res, next) => {
+    const { ingredients, foodCores } = req.body || {};
+
+    /* ⚠️ THE ELEMENTS, NOT JUST THE ARRAY. `Array.isArray` alone let
+       `[123]` through to `(123 || '').trim()` below — a number is truthy, so
+       the `|| ''` guard does not catch it — and that TypeError inside an async
+       handler took the process down. `foodCores` is validated too because it
+       is indexed in parallel with `ingredients` a few lines on. */
+    if (!Array.isArray(ingredients) || !ingredients.every(i => typeof i === 'string')) {
+        return res.status(400).json({ error: "ingredients must be an array of strings" });
+    }
+    if (foodCores !== undefined
+        && (!Array.isArray(foodCores) || !foodCores.every(c => c == null || typeof c === 'string'))) {
+        return res.status(400).json({ error: "foodCores must be an array of strings or nulls" });
+    }
+
+    /**
+     * ⚠️ SIXTY IS A JUDGEMENT, NOT A DERIVED NUMBER, and whoever wants to
+     * raise it should know that. There is no rule in the generation prompt
+     * capping ingredients per meal; what the prompt actually discusses is
+     * meals with "1-2 ingredients" and "3+ ingredients", and `/analyze` is
+     * called once per MEAL (DietSetupFlow passes `meal.ingredients`). So the
+     * observed shape is single digits and this is roughly ten times it.
+     */
+    if (ingredients.length > MAX_INGREDIENTS) {
+        return res.status(400).json({ error: `ingredients must contain at most ${MAX_INGREDIENTS} entries` });
+    }
+    /* These strings become FatSecret search expressions AND get embedded in a
+       model prompt. Nothing a meal contains is this long; something that is,
+       is either a mistake or an attempt to use the prompt as a channel. */
+    if (ingredients.some(i => i.length > MAX_INGREDIENT_CHARS)) {
+        return res.status(400).json({ error: `each ingredient must be at most ${MAX_INGREDIENT_CHARS} characters` });
+    }
+    /* The two arrays are read by a shared index, so entries past the end of
+       `ingredients` can never be reached — a longer one is always a mistake,
+       and saying so beats silently ignoring the tail. */
+    if (Array.isArray(foodCores) && foodCores.length > ingredients.length) {
+        return res.status(400).json({ error: "foodCores must not be longer than ingredients" });
+    }
+
+    // Pair each ingredient with its food_core (if any) before filtering out blank
+    // ingredients - filtering the two arrays independently risks shifting them out
+    // of index alignment.
+    const paired = ingredients
+        .map((ing, i) => ({
+            ingredient: (ing || '').trim(),
+            foodCore: Array.isArray(foodCores) ? (foodCores[i] || null) : null
+        }))
+        .filter(p => p.ingredient.length > 0);
+    const cleanIngredients = paired.map(p => p.ingredient);
+    const cleanFoodCores = paired.map(p => p.foodCore);
+
+    req.nutrition = { paired, cleanIngredients, cleanFoodCores };
+    return next();
+};
+
+/** The ingredient cost of a validated request — see AI_LIMITS.nutrition. */
+const ingredientCost = (req) => req.nutrition?.cleanIngredients.length ?? 0;
+
+/**
  * Timing for the nutrition routes.
  *
  * Middleware rather than a line at each `res.json`, because between them these
@@ -2593,33 +2726,48 @@ app.use(['/api/nutrition/analyze', '/api/nutrition/estimate'], (req, res, next) 
    limiter is sized for a meal and this parser permits a dictionary, which is
    H3 and is NOT fixed by this number. The cap that matters is on the array
    length, in the handler, and it is still missing. */
-app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), rateLimitFixed('nutrition'), wrap(async (req, res) => {
-    const { ingredients, foodCores } = req.body;
+app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), validateIngredients, rateLimitFixed('nutrition', ingredientCost), wrap(async (req, res) => {
+    /* Validated, capped, paired and costed by `validateIngredients` before the
+       limiter ran — see it for why that order matters. */
+    const { cleanIngredients, cleanFoodCores } = req.nutrition;
 
-    /* ⚠️ THE ELEMENTS, NOT JUST THE ARRAY. `Array.isArray` alone let
-       `[123]` through to `(123 || '').trim()` below — a number is truthy, so
-       the `|| ''` guard does not catch it — and that TypeError inside an async
-       handler took the process down. `foodCores` is validated too because it
-       is indexed in parallel with `ingredients` a few lines on. */
-    if (!Array.isArray(ingredients) || !ingredients.every(i => typeof i === 'string')) {
-        return res.status(400).json({ error: "ingredients must be an array of strings" });
-    }
-    if (foodCores !== undefined
-        && (!Array.isArray(foodCores) || !foodCores.every(c => c == null || typeof c === 'string'))) {
-        return res.status(400).json({ error: "foodCores must be an array of strings or nulls" });
-    }
+    /**
+     * Has the caller gone? Checked where it can save an upstream call.
+     *
+     * ⚠️ NOT `req.destroyed`. That is what this was, and it shipped broken for
+     * one commit: `req.destroyed` goes true as soon as the request BODY has
+     * been fully consumed, which `express.json` does before the handler ever
+     * runs. It says nothing about the client. Measured on node v24.15.0, one
+     * connected curl that waits for its answer:
+     *
+     *     t=0     req.destroyed=false  res.destroyed=false  closeFlag=false
+     *     t=150   req.destroyed=TRUE   res.destroyed=false  closeFlag=false
+     *     t=1150  req.destroyed=TRUE   res.destroyed=false  closeFlag=false
+     *
+     * and the same client aborting at 0.4s:
+     *
+     *     t=1150  req.destroyed=TRUE   res.destroyed=TRUE   closeFlag=TRUE
+     *
+     * So every request with two or more ingredients stopped after the first
+     * and never answered — the loop returned without writing, and the caller
+     * hung until its own 180s timeout.
+     *
+     * ⚠️ A LATCHED FLAG, NOT `res.destroyed`, THOUGH BOTH WORK. The table
+     * above shows `res.destroyed` and `req.socket.destroyed` are both correct
+     * signals. This uses the close event instead for one reason: the nutrition
+     * logger a few hundred lines up decides CLIENT ABORTED with exactly this
+     * test — `res.on('close')` with `!res.writableEnded`. Sharing the idiom
+     * means the log line and the loop cannot disagree about what an abort is.
+     * Picking a second `.destroyed` property would also be the same bet that
+     * just lost: trusting a property name to mean what it sounds like.
+     *
+     * `!res.writableEnded` is what separates an abort from a normal finish —
+     * `close` fires for both, and nothing has been written while the loop runs.
+     */
+    let clientGone = false;
+    res.on('close', () => { if (!res.writableEnded) clientGone = true; });
+    const aborted = () => clientGone;
 
-    // Pair each ingredient with its food_core (if any) before filtering out blank
-    // ingredients - filtering the two arrays independently risks shifting them out
-    // of index alignment.
-    const paired = ingredients
-        .map((ing, i) => ({
-            ingredient: (ing || '').trim(),
-            foodCore: Array.isArray(foodCores) ? (foodCores[i] || null) : null
-        }))
-        .filter(p => p.ingredient.length > 0);
-    const cleanIngredients = paired.map(p => p.ingredient);
-    const cleanFoodCores = paired.map(p => p.foodCore);
     if (cleanIngredients.length === 0) {
         return res.json({ calories: 0, protein: 0, carbs: 0, fat: 0 });
     }
@@ -2753,6 +2901,25 @@ app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription),
         const unresolvedIngredients = [];
 
         for (let ingIndex = 0; ingIndex < cleanIngredients.length; ingIndex++) {
+            /**
+             * ⚠️ NOBODY IS LISTENING, SO STOP SPENDING. Neither loop used to
+             * check, so a client that hung up — or gave up at its own 180s
+             * ceiling — left this working through the rest of the array at up
+             * to five upstream calls an ingredient, with the answer going
+             * nowhere. That is the "keeps spending after the client leaves"
+             * half of H3, and it is the half an attacker gets for free: open,
+             * send sixty ingredients, disconnect, repeat.
+             *
+             * ⚠️ IT DOES NOT CANCEL THE CALL ALREADY IN FLIGHT, deliberately.
+             * Threading an AbortController through `fatSecretPost` and both
+             * Gemini helpers would save at most one request per abort, and
+             * each is individually bounded by its own timeout. Not starting
+             * the next one is where the saving is.
+             */
+            if (aborted()) {
+                console.warn(`[Nutrition] stopped at ingredient ${ingIndex + 1} of ${cleanIngredients.length} after disconnect`);
+                return;
+            }
             const ingStr = cleanIngredients[ingIndex];
             const foodCore = cleanFoodCores[ingIndex];
             // Small pacing gap between ingredients (not before the first one) so a
@@ -2795,7 +2962,12 @@ app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription),
                 // mechanically-simplified term with leading descriptors stripped, tried
                 // only when the full phrase matched nothing at all.
                 foodItem = await searchFoodItem(parsedIng.food, token, foodCore);
-                if (!foodItem && parsedIng.foodSimplified) {
+                /* ⚠️ CHECKED AGAIN HERE, not only at the top of the loop. One
+                   iteration is up to three `searchFoodItem` calls, each of
+                   which can run `pickBestFoodMatchWithAI` — so a check only at
+                   the top honours a disconnect a whole iteration late, which
+                   on this route is most of the cost. */
+                if (!foodItem && parsedIng.foodSimplified && !aborted()) {
                     console.log(`[Free Search] No result for "${parsedIng.food}", retrying simplified: "${parsedIng.foodSimplified}"`);
                     foodItem = await searchFoodItem(parsedIng.foodSimplified, token, foodCore);
                 }
@@ -2812,7 +2984,7 @@ app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription),
                         .filter(Boolean)
                         .map(s => s.trim().toLowerCase());
                     const coreNormalized = foodCore.trim().toLowerCase();
-                    if (coreNormalized && !alreadyTried.includes(coreNormalized)) {
+                    if (coreNormalized && !alreadyTried.includes(coreNormalized) && !aborted()) {
                         console.log(`[Free Search] No result for "${parsedIng.food}", retrying with food_core: "${foodCore}"`);
                         foodItem = await searchFoodItem(foodCore, token, foodCore);
                     }
@@ -2961,33 +3133,58 @@ app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription),
 // has ALSO failed. Deliberately separate from /api/nutrition/analyze rather
 // than an automatic fallback inside it, so a real database match is always
 // preferred and this only fires for the genuinely unresolvable remainder.
-app.post('/api/nutrition/estimate', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), rateLimitFixed('nutrition'), wrap(async (req, res) => {
-    const { ingredients, foodCores } = req.body;
+app.post('/api/nutrition/estimate', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), validateIngredients, rateLimitFixed('nutrition', ingredientCost), wrap(async (req, res) => {
+    /* Validated, capped, paired and costed by `validateIngredients` before the
+       limiter ran — see it for why that order matters. */
+    const { paired } = req.nutrition;
 
-    /* ⚠️ THE ELEMENTS, NOT JUST THE ARRAY. `Array.isArray` alone let
-       `[123]` through to `(123 || '').trim()` below — a number is truthy, so
-       the `|| ''` guard does not catch it — and that TypeError inside an async
-       handler took the process down. `foodCores` is validated too because it
-       is indexed in parallel with `ingredients` a few lines on. */
-    if (!Array.isArray(ingredients) || !ingredients.every(i => typeof i === 'string')) {
-        return res.status(400).json({ error: "ingredients must be an array of strings" });
-    }
-    if (foodCores !== undefined
-        && (!Array.isArray(foodCores) || !foodCores.every(c => c == null || typeof c === 'string'))) {
-        return res.status(400).json({ error: "foodCores must be an array of strings or nulls" });
-    }
-
-    const paired = ingredients
-        .map((ing, i) => ({
-            ingredient: (ing || '').trim(),
-            foodCore: Array.isArray(foodCores) ? (foodCores[i] || null) : null
-        }))
-        .filter(p => p.ingredient.length > 0);
+    /**
+     * Has the caller gone? Checked where it can save an upstream call.
+     *
+     * ⚠️ NOT `req.destroyed`. That is what this was, and it shipped broken for
+     * one commit: `req.destroyed` goes true as soon as the request BODY has
+     * been fully consumed, which `express.json` does before the handler ever
+     * runs. It says nothing about the client. Measured on node v24.15.0, one
+     * connected curl that waits for its answer:
+     *
+     *     t=0     req.destroyed=false  res.destroyed=false  closeFlag=false
+     *     t=150   req.destroyed=TRUE   res.destroyed=false  closeFlag=false
+     *     t=1150  req.destroyed=TRUE   res.destroyed=false  closeFlag=false
+     *
+     * and the same client aborting at 0.4s:
+     *
+     *     t=1150  req.destroyed=TRUE   res.destroyed=TRUE   closeFlag=TRUE
+     *
+     * So every request with two or more ingredients stopped after the first
+     * and never answered — the loop returned without writing, and the caller
+     * hung until its own 180s timeout.
+     *
+     * ⚠️ A LATCHED FLAG, NOT `res.destroyed`, THOUGH BOTH WORK. The table
+     * above shows `res.destroyed` and `req.socket.destroyed` are both correct
+     * signals. This uses the close event instead for one reason: the nutrition
+     * logger a few hundred lines up decides CLIENT ABORTED with exactly this
+     * test — `res.on('close')` with `!res.writableEnded`. Sharing the idiom
+     * means the log line and the loop cannot disagree about what an abort is.
+     * Picking a second `.destroyed` property would also be the same bet that
+     * just lost: trusting a property name to mean what it sounds like.
+     *
+     * `!res.writableEnded` is what separates an abort from a normal finish —
+     * `close` fires for both, and nothing has been written while the loop runs.
+     */
+    let clientGone = false;
+    res.on('close', () => { if (!res.writableEnded) clientGone = true; });
+    const aborted = () => clientGone;
 
     const items = [];
     const failed = [];
 
     for (let i = 0; i < paired.length; i++) {
+        /* One Gemini call per ingredient here, so the top of the loop is the
+           only place worth checking — see the longer note on /analyze. */
+        if (aborted()) {
+            console.warn(`[Nutrition] stopped at ingredient ${i + 1} of ${paired.length} after disconnect`);
+            return;
+        }
         // Same pacing gap as /api/nutrition/analyze - avoid bursting requests.
         if (i > 0) await new Promise(resolve => setTimeout(resolve, 120));
 
