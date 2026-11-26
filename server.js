@@ -1,5 +1,4 @@
 const express = require('express');
-const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
@@ -8,7 +7,39 @@ const PORT = process.env.PORT || 4000;
 /* USE_NATIVE_NLP and REQUIRE_SUBSCRIPTION are parsed with the other
    environment values further down — see `envFlag`. */
 
-app.use(cors());
+/**
+ * ⚠️ NO CORS MIDDLEWARE, AND NO `cors` DEPENDENCY (L4). This served
+ * `app.use(cors())` — every origin, every route — for as long as the proxy
+ * existed. It was never a CSRF vector, because auth here is a bearer token
+ * that no browser attaches automatically and `cors()` never set
+ * `Access-Control-Allow-Credentials`, so a hostile page could only ever make
+ * UNAUTHENTICATED requests and read a 401.
+ *
+ * It is gone because nothing needs it: the app ships to Android and iOS only
+ * and cannot run in a browser. A native client sends no Origin that matters
+ * and never sends a preflight, so no response the app sees changes shape —
+ * the only observable difference is that `Access-Control-*` headers stop
+ * appearing. The `web` block in app.json and the gitignored `dist/` from
+ * 6 November were a local `expo start --web` convenience, never a shipped
+ * target, and there is no hosting config anywhere in the repo.
+ *
+ * ⚠️ IF A BROWSER CLIENT IS EVER SERVED FROM A FIXED ORIGIN, THIS IS WHAT
+ * HAS TO COME BACK, narrowed to that origin rather than reopened to all. A
+ * browser enforces CORS, so every proxy call from that page fails without it
+ * — and the failure looks like a network error, not a permissions one.
+ *
+ * ⚠️ REMOVING IT CHANGES WHO ANSWERS OPTIONS, AND NOT TO A 404. `cors()`
+ * terminated preflights itself with a 204 and never called `next()`. Without
+ * it, Express's OWN default takes over and replies 200 with an `Allow` header
+ * and a `text/html` body naming the methods — measured, not assumed. It does
+ * not fall through to any later middleware, because the router handles it. So
+ * a preflight still gets an answer; it is simply not a CORS one, which is what
+ * a future browser client would notice first.
+ */
+
+/* Express advertises itself in every response otherwise. It names the
+   framework and invites version-specific probing for nothing in return. */
+app.disable('x-powered-by');
 
 /**
  * ⚠️ THERE IS NO GLOBAL BODY PARSER, AND THAT IS DELIBERATE (M4).
