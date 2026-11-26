@@ -706,6 +706,281 @@ const countChargedGenerations = async (token, userId, operation) => {
 };
 
 /**
+ * THE PER-USER MONTHLY SPEND BUDGET, in cost units — the only control in this
+ * file that bounds a MONTH rather than an hour or a single call.
+ *
+ * ⚠️ WHY A THIRD CONTROL. The `operation` allow-list picks which burst bucket a
+ * call spends from, and the part caps bound what one call can cost. Neither
+ * bounds a month: `machinery` admits 120 calls an hour and the two monthly
+ * buckets count GENERATIONS, not cost, so eight of the sixteen labels had no
+ * monthly bound of any kind. This is what closes "cheap label, expensive
+ * prompt" — whatever the label claims, the month is bounded by what the calls
+ * actually cost.
+ *
+ * ⚠️ ONE UNIT IS ONE OUTPUT TOKEN, AND PROMPT TOKENS ARE DIVIDED RATHER THAN
+ * COUNTED. Gemini bills input at a fifth of output, so a budget on raw totals
+ * would be dominated by the cheap side and a photo-heavy legitimate month
+ * could exhaust an allowance it barely costs — the heaviest real month on
+ * record is 70k prompt against 25k out+think, a ratio of nearly three to one
+ * the wrong way. Dividing makes the number a cost figure instead of a volume.
+ *
+ * ⚠️ THE DIVISOR IS A PRICE FACT AND WILL MOVE. gemini-3.8-flash on the
+ * STANDARD rate card, read 2026-11-26: $1.50 per 1M input, $7.50 per 1M
+ * output, thinking billed AS output. 7.50 / 1.50 = 5. If the card changes,
+ * this is the line to change, and it is deliberately not env-driven: a wrong
+ * environment value would silently distort every budget decision with nothing
+ * in the log to say so.
+ */
+const PROMPT_UNIT_DIVISOR = 5;
+
+/**
+ * ⚠️ NOT IN `AI_LIMITS`, DELIBERATELY, and this is the trap it avoids.
+ * `sendRateLimited` fills the response's `limit` from `AI_LIMITS[bucket]`, and
+ * the client turns that number into prose. Every other bucket's limit counts
+ * REQUESTS; this one counts token-equivalents, so publishing it would put
+ * "500000" in a sentence built to say how many plans someone built. Absent
+ * from the table, `limit` resolves to null and the client's copy says nothing
+ * about the size — which is the honest answer, since no user can act on a
+ * token figure. The budget is still logged on every refusal.
+ */
+const MONTHLY_UNIT_BUDGET = limitFrom('monthly_spend', 500000);
+
+/**
+ * ⚠️ ONE EXPRESSION FOR EVERY UNTRUSTED NUMBER OUT OF `ai_usage`. The table's
+ * RLS allows INSERT-own, the four token columns are plain `integer NOT NULL
+ * DEFAULT 0` with no CHECK, and a user can therefore insert rows under their
+ * own id with NEGATIVE counts to lower any sum computed from it. Clamping per
+ * ROW rather than on the total is what makes that useless: a negative row
+ * contributes zero instead of subtracting. `Number.isFinite` covers null,
+ * undefined and NaN in the same test, so a column that is not what the schema
+ * promises cannot poison the sum either.
+ *
+ * A DB-level CHECK is the right home for this and is a follow-up outside this
+ * repo; the clamp defends regardless of whether that ever lands.
+ */
+const nonNegative = (v) => (Number.isFinite(v) && v > 0 ? v : 0);
+
+const unitsFromTokens = (promptTokens, outputTokens, thinkingTokens) =>
+    nonNegative(promptTokens) / PROMPT_UNIT_DIVISOR
+    + nonNegative(outputTokens)
+    + nonNegative(thinkingTokens);
+
+/**
+ * userId -> { monthKey, units, seeded, seedPromise }
+ *
+ * ⚠️ IN MEMORY, AND IT DIES ON REDEPLOY — the same property `aiHits` has and
+ * the same accepted cost. A restart reseeds from `ai_usage` on each user's
+ * next call, so the figure is recovered rather than lost; what a restart
+ * actually forgives is the few seconds of spend not yet flushed to the table.
+ *
+ * ⚠️ AND IT IS WHY THIS WORKS AT ALL. A budget read from `ai_usage` on every
+ * call CANNOT bound a burst: `logUsage` buffers rows for up to USAGE_FLUSH_MS
+ * (5s) or USAGE_FLUSH_ROWS (50), so concurrent calls all read a total that
+ * predates every one of them. 120 concurrent requests would each see zero and
+ * all pass, overshooting a 500k budget by more than an order of magnitude
+ * before the first row landed. The accumulator is synchronous, so admissions
+ * see each other.
+ */
+const monthlyUnits = new Map();
+
+const monthKeyOf = (start) => start.toISOString().slice(0, 7);
+
+/**
+ * This user's spend so far this calendar month, in units, from `ai_usage`.
+ *
+ * Reads as the user under RLS with their own JWT, exactly as
+ * `countChargedGenerations` does and for the same reason: no service-role key
+ * exists on this box. Returns null when the answer is genuinely unknown, which
+ * the caller must not confuse with zero — see `ensureMonthlyUnitsSeeded`.
+ *
+ * ⚠️ NO `operation` FILTER, UNLIKE `countChargedGenerations`. The whole point
+ * is that the label does not bound the month, so the sum is across every
+ * operation this user has been charged for — including the server-internal
+ * `match` and `estimate` rows, which are real spend under this user's name.
+ */
+const readMonthlyUnits = async (token, userId) => {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !token) return null;
+    const { start } = monthWindow();
+
+    const url = `${SUPABASE_URL}/rest/v1/ai_usage`
+        + `?select=prompt_tokens,output_tokens,thinking_tokens`
+        + `&user_id=eq.${encodeURIComponent(userId)}`
+        + `&created_at=gte.${encodeURIComponent(start.toISOString())}`;
+
+    try {
+        const r = await fetch(url, {
+            headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
+        });
+        if (!r.ok) {
+            console.warn(`[ratelimit] ai_usage unit read returned ${r.status}`);
+            return null;
+        }
+        const rows = await r.json();
+        if (!Array.isArray(rows)) return null;
+        let units = 0;
+        for (const row of rows) {
+            units += unitsFromTokens(row?.prompt_tokens, row?.output_tokens, row?.thinking_tokens);
+        }
+        return units;
+    } catch (err) {
+        console.warn('[ratelimit] ai_usage unit read failed:', err?.message || err);
+        return null;
+    }
+};
+
+/**
+ * Seed this user's accumulator for this month, at most once.
+ *
+ * ⚠️ THE PROMISE IS CACHED, NOT THE RESULT, because the first two calls of a
+ * user-month race. Both await the same promise and one DB read happens; the
+ * alternative is two reads where the second overwrites whatever the first had
+ * already accumulated.
+ *
+ * ⚠️ A FAILED SEED DELETES THE ENTRY AND NEVER WRITES `units: 0`. Writing zero
+ * would hand that user a fresh month on the strength of one Supabase blip —
+ * the same mistake as treating a failed read as an empty one, which is the
+ * shape that bit `countChargedGenerations`. Deleting means the next request
+ * retries instead of enforcing against a number nobody knows.
+ *
+ * ⚠️ A MONTH ROLLOVER RESEEDS, IT DOES NOT RESET TO ZERO, for that same
+ * reason: the new month's real spend is whatever the table says, and on the
+ * first of the month that is usually zero but is not guaranteed to be.
+ */
+const ensureMonthlyUnitsSeeded = (token, userId) => {
+    if (!userId) return Promise.resolve(false);
+    const monthKey = monthKeyOf(monthWindow().start);
+
+    let entry = monthlyUnits.get(userId);
+    if (entry && entry.monthKey !== monthKey) {
+        monthlyUnits.delete(userId);
+        entry = undefined;
+    }
+    if (entry) return entry.seedPromise || Promise.resolve(entry.seeded);
+
+    const fresh = { monthKey, units: 0, seeded: false, seedPromise: null };
+    fresh.seedPromise = (async () => {
+        const seeded = await readMonthlyUnits(token, userId);
+        if (seeded === null) {
+            /* Only drop the entry if it is still ours — a rollover during the
+               read would otherwise delete the new month's fresh one. */
+            if (monthlyUnits.get(userId) === fresh) monthlyUnits.delete(userId);
+            console.warn(`[ratelimit] monthly spend unknown for ${userId}, allowing`);
+            return false;
+        }
+        fresh.units += seeded;
+        fresh.seeded = true;
+        fresh.seedPromise = null;
+        return true;
+    })();
+
+    monthlyUnits.set(userId, fresh);
+    return fresh.seedPromise;
+};
+
+/** The live entry, or null when there is nothing to enforce against. */
+const seededEntry = (userId) => {
+    const entry = monthlyUnits.get(userId);
+    if (!entry || !entry.seeded) return null;
+    return entry.monthKey === monthKeyOf(monthWindow().start) ? entry : null;
+};
+
+/**
+ * Check and reserve in ONE synchronous step.
+ *
+ * ⚠️ NOTHING MAY AWAIT BETWEEN THE READ AND THE WRITE. That gap is the whole
+ * burst hole this mechanism exists to close: two concurrent admissions that
+ * both read before either writes both pass. The seed is awaited by the CALLER,
+ * before this runs, precisely so this function can stay synchronous.
+ *
+ * Returns `{ ok: true, token: null }` when the user is unseeded — fail open,
+ * because the hourly ceilings still bound them and a Supabase outage must not
+ * read as a quota.
+ */
+const reserveMonthlyUnits = (userId) => {
+    const entry = seededEntry(userId);
+    if (!entry) return { ok: true, token: null, units: 0 };
+
+    if (entry.units + RESERVE_PER_ATTEMPT > MONTHLY_UNIT_BUDGET) {
+        return { ok: false, token: null, units: entry.units };
+    }
+    entry.units += RESERVE_PER_ATTEMPT;
+    return {
+        ok: true,
+        units: entry.units,
+        token: { userId, monthKey: entry.monthKey, reserved: RESERVE_PER_ATTEMPT, released: false },
+    };
+};
+
+/**
+ * Give back the reservation. Idempotent, and safe to call for a request that
+ * never spent anything.
+ *
+ * ⚠️ REGISTERED ON `res.on('close')`, WHICH FIRES FOR EVERY RESPONSE — abort
+ * and normal finish alike (measured: on a completed request it lands after
+ * `finish`, with `writableEnded` true). A request-level `finally` was the
+ * other candidate and it LEAKS: the handler's try block sits after two early
+ * returns, so a missing-API-key 500 would never reach it, and a leaked
+ * reservation inflates that user's month invisibly until the process restarts.
+ *
+ * ⚠️ IT RELEASES, AND IT MUST NOT CHARGE. Charging the reservation here would
+ * DOUBLE-COUNT every abandoned generation, which is the commonest failure mode
+ * on the diet draft: the upstream fetch carries no AbortSignal, so when the
+ * app's 180s deadline fires the Gemini call keeps running and `logUsage`
+ * settles the real figure afterwards. Close releases, completion settles, and
+ * the two never describe the same tokens.
+ */
+const releaseMonthlyUnits = (token) => {
+    if (!token || token.released) return;
+    token.released = true;
+    const entry = monthlyUnits.get(token.userId);
+    if (!entry || entry.monthKey !== token.monthKey) return;
+    entry.units = Math.max(0, entry.units - token.reserved);
+};
+
+/**
+ * Add measured spend. Called from `logUsage`, so every billed call settles
+ * once — including the server-internal match and estimate calls, which resolve
+ * their user from `callerContext` and are real spend under that user's name.
+ *
+ * Silently does nothing for an unseeded user: there is no total to add to, and
+ * the next seed reads the figure out of the table instead.
+ */
+const settleMonthlyUnits = (userId, units) => {
+    if (!(units > 0)) return;
+    const entry = seededEntry(userId);
+    if (!entry) return;
+    entry.units += units;
+};
+
+
+/**
+ * The monthly-spend refusal. Mirrors `allowUnderHourlyCeiling`'s header
+ * handling for the same reasons documented there: the headers name the bucket
+ * that actually refused, and `X-RateLimit-Reset` is dropped because a month
+ * date on it would overwrite the client's stored per-bucket allowance.
+ */
+const refuseMonthlySpend = (req, res, label, units) => {
+    const { end } = monthWindow();
+    const retryAfterSec = Math.max(1, Math.ceil((end.getTime() - Date.now()) / 1000));
+    console.warn(
+        `[ratelimit] ${req.userId} exhausted monthly_spend — `
+        + `${Math.round(units)} of ${MONTHLY_UNIT_BUDGET} units (label=${label ?? 'none'})`
+    );
+    res.removeHeader('X-RateLimit-Reset');
+    res.setHeader('X-RateLimit-Bucket', 'monthly_spend');
+    res.setHeader('X-RateLimit-Window', 'month');
+    res.setHeader('X-RateLimit-Remaining', '0');
+    return sendRateLimited(req, res, {
+        bucket: 'monthly_spend',
+        label,
+        window: 'month',
+        retryAfterSec,
+        extra: { resetAt: end.toISOString() },
+    });
+};
+
+
+/**
  * The middleware. Runs AFTER requireUser, which is what puts `req.userId` here.
  *
  * ⚠️ AN UNRECOGNISED OR MISSING LABEL FALLS TO MACHINERY rather than being
@@ -1084,7 +1359,29 @@ const validateAiRequest = (req, res, next) => {
  *               that a request this limiter would reject has already been
  *               rejected for being malformed, and never charges for it.
  */
-const rateLimitFixed = (bucket, costOf) => (req, res, next) => {
+const rateLimitFixed = (bucket, costOf) => async (req, res, next) => {
+    /**
+     * ⚠️ IT CHECKS THE MONTHLY BUDGET BUT DOES NOT RESERVE AGAINST IT, and
+     * the asymmetry with `rateLimitAi` is deliberate. One nutrition request
+     * fans out INSIDE the handler into a Gemini call per ambiguous ingredient
+     * — up to MAX_INGREDIENTS of them — so a reservation sized for the worst
+     * case would refuse legitimate meals outright. Each of those calls settles
+     * its own measured units through `logUsage` as it completes, so the month
+     * is still counted; what is missing is only the in-flight reservation, and
+     * the 200/hour bucket below is what bounds the burst.
+     *
+     * ⚠️ AND IT IS ASYNC SO THE SEED CAN HAPPEN HERE. Checking only when
+     * already seeded would fail open for a client that hits these routes
+     * without ever touching an AI route — which is precisely the direct-loop
+     * case the hourly bucket exists for.
+     */
+    const caller = callerContext.getStore();
+    await ensureMonthlyUnitsSeeded(caller?.token, req.userId);
+    const spent = seededEntry(req.userId);
+    if (spent && spent.units >= MONTHLY_UNIT_BUDGET) {
+        return refuseMonthlySpend(req, res, null, spent.units);
+    }
+
     const cost = costOf ? costOf(req) : 1;
     const { ok, remaining, retryAfterSec } = takeAiToken(req.userId, bucket, null, cost);
     res.setHeader('X-RateLimit-Bucket', bucket);
@@ -1101,6 +1398,27 @@ const rateLimitAi = async (req, res, next) => {
 
     const refuse = (window, retryAfterSec, extra) =>
         sendRateLimited(req, res, { bucket, label, window, retryAfterSec, extra });
+
+    /**
+     * THE MONTHLY SPEND BUDGET, CHECKED FIRST because it is the outermost
+     * bound: once the month is spent, which bucket the label names is moot.
+     *
+     * ⚠️ THE AWAIT IS HERE AND NOT INSIDE THE RESERVE. `reserveMonthlyUnits`
+     * must stay synchronous — an await between its read and its write is the
+     * burst hole it exists to close — so the seed is awaited by the caller,
+     * once per user-month, with the promise shared by concurrent first calls.
+     *
+     * ⚠️ A LATER REFUSAL BRIEFLY HOLDS A RESERVATION. If the hourly or
+     * monthly bucket below refuses after this point, the reservation lives
+     * until the response closes and is then given back. That is the safe
+     * direction — a concurrent request sees slightly MORE spend than is real,
+     * never less — and the refusal itself still consumes no hourly token.
+     */
+    const spendCaller = callerContext.getStore();
+    await ensureMonthlyUnitsSeeded(spendCaller?.token, req.userId);
+    const spend = reserveMonthlyUnits(req.userId);
+    if (!spend.ok) return refuseMonthlySpend(req, res, label, spend.units);
+    if (spend.token) res.on('close', () => releaseMonthlyUnits(spend.token));
 
     /**
      * The hourly ceiling under a monthly bucket. Every ALLOW path of the
@@ -2342,6 +2660,24 @@ const logUsage = (op, modelName, data, elapsedMs) => {
     const caller = callerContext.getStore();
     if (!caller?.userId || !caller?.token) return;
 
+    /**
+     * ⚠️ SETTLE HERE, WHICH MEANS A NON-OK ATTEMPT IS CHARGED NOTHING. This
+     * function is only called when Gemini answered ok, and a non-ok response
+     * carries no `usageMetadata` to settle from anyway. That is the intended
+     * reading: an attempt that produced no output cost nothing, and probing
+     * for refusals is already bounded by the burst token spent at admission.
+     *
+     * ⚠️ IT IS WHERE SETTLE BELONGS RATHER THAN THE HANDLER, because the
+     * server-internal `match` and `estimate` calls come through here too —
+     * they resolve their user from `callerContext` and are real spend under
+     * that user's name. Settling in the generate handler would miss both, and
+     * they are the highest-volume calls in the service.
+     */
+    settleMonthlyUnits(
+        caller.userId,
+        unitsFromTokens(u.promptTokenCount, u.candidatesTokenCount, think),
+    );
+
     usageBuffer.push({
         token: caller.token,
         row: {
@@ -2427,6 +2763,50 @@ const DEFAULT_THINKING_BUDGET = Number(process.env.GEMINI_DEFAULT_THINKING ?? 10
  */
 const GEMINI_MAX_OUTPUT_TOKENS = envInt('GEMINI_MAX_OUTPUT_TOKENS', 32768, '[gemini]');
 const GEMINI_MAX_THINKING = envInt('GEMINI_MAX_THINKING', 4096, '[gemini]');
+
+/**
+ * What ONE attempt is charged at admission, before anyone knows its real cost.
+ *
+ * ⚠️ IT IS A TRUE UPPER BOUND, WHICH IS WHY CHARS CONVERT AT 1 AND NOT 4.
+ * Four characters per token is the realistic ratio and would make this four
+ * times smaller — but then the sentence "the reservation covers the worst
+ * case" is false for dense Unicode, and the whole burst defence rests on that
+ * sentence. Same bound `MAX_PROMPT_CHARS` relies on: tokens per character is
+ * at most about 1.
+ *
+ * ⚠️ ONE ATTEMPT, NOT TWO, EVEN THOUGH THE FALLBACK MAKES TWO POSSIBLE. The
+ * attempts are awaited in order and the reservation is not released until the
+ * response closes, so during the second attempt the accumulator holds
+ * `measured_1 + RESERVE` — exactly right, with the second attempt's unknown
+ * cost covered by the reservation still outstanding. Reserving two would halve
+ * legitimate concurrency to no purpose.
+ *
+ * ⚠️ THE IMAGE ALLOWANCE IS A JUDGEMENT AND ITS EXACT VALUE DOES NOT MATTER.
+ * Gemini bills an image by tile count, 258 tokens per 768x768 tile: a 12 MP
+ * 3:4 photo is ~24 tiles (~6,200 tokens) and a 48 MP original at quality 0.8
+ * with no resize — which the Supabase Storage fallback in the photo senders
+ * can serve — is ~88 tiles (~22,700). 8,000 sits above the common case and
+ * below the extreme. It is only ever a RESERVATION: `logUsage` settles the
+ * measured figure, so an under-reserve costs a few seconds of concurrency
+ * headroom while a call is in flight and never distorts the monthly total.
+ */
+const IMAGE_TOKEN_ALLOWANCE = 8000;
+const RESERVE_PER_ATTEMPT =
+    (MAX_PROMPT_CHARS + MAX_IMAGE_PARTS * IMAGE_TOKEN_ALLOWANCE) / PROMPT_UNIT_DIVISOR
+    + GEMINI_MAX_OUTPUT_TOKENS + GEMINI_MAX_THINKING;
+
+/**
+ * ⚠️ A BUDGET SMALLER THAN ONE RESERVATION REFUSES EVERY CALL, including the
+ * first of the month, and the refusal would look like a quota working rather
+ * than a misconfiguration. Anyone lowering AI_LIMIT_MONTHLY_SPEND to throttle
+ * a user would hit this long before they reached zero.
+ */
+if (MONTHLY_UNIT_BUDGET < RESERVE_PER_ATTEMPT) {
+    throw new Error(
+        `[ratelimit] AI_LIMIT_MONTHLY_SPEND is ${MONTHLY_UNIT_BUDGET} but one attempt reserves `
+        + `${Math.round(RESERVE_PER_ATTEMPT)} units, so every call would be refused. Raise it above that.`
+    );
+}
 
 /** The only two the client asks for, and the only two worth forwarding. */
 const ALLOWED_RESPONSE_MIME_TYPES = new Set(['application/json', 'text/plain']);
@@ -3195,7 +3575,7 @@ app.use(['/api/nutrition/analyze', '/api/nutrition/estimate'], (req, res, next) 
    limiter is sized for a meal and this parser permits a dictionary, which is
    H3 and is NOT fixed by this number. The cap that matters is on the array
    length, in the handler, and it is still missing. */
-app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), validateIngredients, rateLimitFixed('nutrition', ingredientCost), wrap(async (req, res) => {
+app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), validateIngredients, wrap(rateLimitFixed('nutrition', ingredientCost)), wrap(async (req, res) => {
     /* Validated, capped, paired and costed by `validateIngredients` before the
        limiter ran — see it for why that order matters. */
     const { cleanIngredients, cleanFoodCores } = req.nutrition;
@@ -3602,7 +3982,7 @@ app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription),
 // has ALSO failed. Deliberately separate from /api/nutrition/analyze rather
 // than an automatic fallback inside it, so a real database match is always
 // preferred and this only fires for the genuinely unresolvable remainder.
-app.post('/api/nutrition/estimate', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), validateIngredients, rateLimitFixed('nutrition', ingredientCost), wrap(async (req, res) => {
+app.post('/api/nutrition/estimate', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), validateIngredients, wrap(rateLimitFixed('nutrition', ingredientCost)), wrap(async (req, res) => {
     /* Validated, capped, paired and costed by `validateIngredients` before the
        limiter ran — see it for why that order matters. */
     const { paired } = req.nutrition;
