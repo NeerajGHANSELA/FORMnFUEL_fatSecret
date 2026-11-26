@@ -429,6 +429,49 @@ for (const b of MONTHLY_BUCKETS) {
 const PER_WORKOUT_BUCKETS = new Set(['workout_swap']);
 
 /**
+ * Every `operation` label the client is allowed to send.
+ *
+ * ⚠️ THIS IS H1'S LESSON APPLIED TO THE OTHER HALF OF THE SAME FIELD. H1 was
+ * `req.body.operation` deciding AUTHORISATION; this is the same client-chosen
+ * string deciding which RATION it spends. `rateLimitAi` resolved anything it
+ * did not recognise to `machinery` — 120/hour, no monthly count — so a
+ * subscriber could run plan generations 120 times an hour by sending
+ * `operation: 'x'`, and the `ai_usage` row recording the spend carried the
+ * label they chose. An unrecognised label is now a 400, not a cheap bucket.
+ *
+ * ⚠️ DERIVED, NOT TRANSCRIBED. A hand-written list of the sixteen labels can
+ * drift from `AI_BUCKETS` in the direction nobody tests: a label present in a
+ * bucket map and absent from the list 400s a working feature in production.
+ * Spreading the keys makes that unrepresentable.
+ *
+ * ⚠️ AND IT SPREADS `AI_BUCKETS`' KEYS, NEVER `MONTHLY_BUCKETS` OR
+ * `PER_WORKOUT_BUCKETS`. Those two hold BUCKET names (`workout_swap`,
+ * `diet_generate`), not operation labels, and spreading them would admit
+ * strings no client sends — each resolving through `AI_BUCKETS` to `undefined`
+ * and landing straight back in `machinery`, which is the hole this closes.
+ *
+ * The eight below are the labels that legitimately carry no bucket of their
+ * own and are metered by `machinery`. Listing them turns that fall-through
+ * from a silent default into a declaration: a new label is a 400 until
+ * someone decides, here, which ration it spends. That is the intended cost of
+ * this check — a client label shipped ahead of its server line fails loudly
+ * rather than quietly buying the cheapest allowance in the table.
+ */
+const MACHINERY_OPERATIONS = new Set([
+    'diet_generate_repair_ingredients',
+    'diet_generate_repair_day',
+    'diet_generate_instructions',
+    'diet_prep_instructions',
+    'diet_meal_swap_evaluate',
+    'workout_exercise_match',
+    'workout_manual_exercise_estimate',
+    'body_fat_estimate',
+]);
+
+const KNOWN_OPERATIONS = new Set([...Object.keys(AI_BUCKETS), ...MACHINERY_OPERATIONS]);
+
+
+/**
  * How close two generate calls must be to count as ONE.
  *
  * ⚠️ THIS IS HOW "A FAILED RUN MUST NOT COUNT" IS ENFORCED WITHOUT TRUSTING
@@ -818,6 +861,186 @@ const buildGenerationConfig = (raw) => {
 
     return { config, warnings };
 };
+
+/**
+ * The per-call INPUT caps for `/api/ai/generate` — the only thing bounding
+ * what one request can cost on the prompt side.
+ *
+ * ⚠️ THIS IS THE AXIS `buildGenerationConfig` DOES NOT TOUCH, and it was the
+ * larger of the two. That function clamps output and thinking to 32768 + 4096,
+ * so a reply has cost a bounded ~$0.28 since it shipped. The prompt had no cap
+ * at all: `promptChars` was computed in the handler and only ever LOGGED, so
+ * the sole bound on input was the body parser and Gemini's own context window
+ * — two to three orders of magnitude above anything this app sends. The
+ * largest prompt in `ai_usage`, across every row ever written, is 3,093
+ * tokens. Input is five times cheaper per token and was the bigger exposure
+ * purely because its ceiling was looser.
+ *
+ * ⚠️ THE PARSER LIMIT IS NOT THIS BOUND AND MUST NOT BE LOWERED TO ACT LIKE
+ * ONE. 25 MiB is sized for PHOTOS: four call sites send up to four body photos
+ * as base64 `inlineData` in a single request — WorkoutSetupFlow twice (plan
+ * generation at 5959 and body-fat estimate at 4184), DietSetupFlow's
+ * generation at 5483, and `bodyComposition.ts` at 334 with one. Two of those
+ * read the photo back from Supabase Storage rather than the 0.6-quality
+ * picker, so the bytes are a stored 0.8-quality original. A text-sized body
+ * limit 413s every one of them. The parser bounds MEMORY; these bound COST.
+ *
+ * ⚠️ TEXT IS CAPPED IN CHARACTERS, NOT TOKENS, deliberately. The route holds
+ * the character count for free, and tokens-per-character is bounded above by
+ * roughly 1 even for dense Unicode, so a character cap is a valid token bound
+ * in the only direction that matters. An exact count would cost a tokenizer or
+ * a `countTokens` round trip on the hot path to refine a number already ten
+ * times the observed maximum.
+ *
+ * ⚠️ 128 KiB IS A JUDGEMENT AND DELIBERATELY NOT 64. The measured maximum is
+ * ~12 KB of characters, which makes 64 KiB a five-times headroom on paper —
+ * but `ai_usage` holds rows for only 6 of the 16 labels, so the prompts of the
+ * other 10 (`workout_plan_swap`, `diet_meal_swap`, the repairs) are UNMEASURED,
+ * and any of them may embed an existing plan as context. The security
+ * difference between 64 KiB and 128 KiB is about $0.024 a call; the difference
+ * in risk is whether a real rebuild 400s in production. Tighten it once there
+ * are rows for every label, not before.
+ */
+const MAX_PROMPT_CHARS = 128 * 1024;
+const MAX_IMAGE_PARTS = 4;
+const MAX_IMAGE_B64_CHARS = 6 * 1024 * 1024;
+const MAX_CONTENTS_ENTRIES = 8;
+const MAX_PARTS_TOTAL = 16;
+const ALLOWED_INLINE_MIME = new Set(['image/jpeg', 'image/png']);
+
+/**
+ * The generate route's body limit, in bytes, as the single source of truth.
+ *
+ * A number rather than `'25mb'` so the assertion below can be exact against
+ * the same value the parser gets. `bytes.parse` returns a number unchanged, so
+ * this is byte-identical to the string it replaces — verified, not assumed.
+ */
+const GENERATE_BODY_LIMIT_BYTES = 25 * 1024 * 1024;
+
+/**
+ * ⚠️ NO SHAPE MAY PASS THE PART CAPS AND THEN FAIL THE PARSER. A body refused
+ * by `express.json` never reaches `validateAiRequest`, so it gets a bare 413
+ * instead of a 400 naming the cap it broke — a worse outcome for a legitimate
+ * four-photo upload than for any attacker. The slack covers the JSON around
+ * the payload (keys, quotes, commas, `generationConfig`, `model`, `operation`),
+ * which the part caps do not count; 64 KiB is ~90x the ~700 bytes 16 parts of
+ * scaffolding actually costs.
+ *
+ * This is the line that enforces the claim. The comment above it is not.
+ */
+const PART_CAP_SLACK_BYTES = 64 * 1024;
+if (MAX_IMAGE_PARTS * MAX_IMAGE_B64_CHARS + MAX_PROMPT_CHARS + PART_CAP_SLACK_BYTES >= GENERATE_BODY_LIMIT_BYTES) {
+    throw new Error(
+        '[gemini] the part caps admit more than the body parser accepts, so a legal request would 413 '
+        + 'instead of being refused by name. Raise GENERATE_BODY_LIMIT_BYTES or lower the caps.'
+    );
+}
+
+/**
+ * What `/api/ai/generate` accepts, checked before any ration is spent.
+ *
+ * ⚠️ IT SITS BEFORE `rateLimitAi`, which is the ordering H3 established for
+ * `validateIngredients`: metering a request we are about to refuse lets an
+ * attacker empty a subscriber's hour with bodies that never reach Gemini, at
+ * no cost to themselves. Shape first, ration second.
+ *
+ * ⚠️ SYNCHRONOUS, SO IT NEEDS NO `wrap` — same reason `validateIngredients`
+ * is used bare on the nutrition routes. See the note above `express.json` on
+ * the route for which middleware there do need it.
+ */
+const validateAiRequest = (req, res, next) => {
+    const operation = req.body?.operation;
+    if (typeof operation !== 'string' || !KNOWN_OPERATIONS.has(operation)) {
+        /* The label is named in the LOG and not in the response: a client
+           guessing at labels should learn nothing about which guesses are
+           warmer. The log line is what makes a missing server line obvious. */
+        console.warn(`[gemini] ${req.userId} unknown operation ${JSON.stringify(operation)} on ${req.path}`);
+        return res.status(400).json({ error: { message: 'Unknown operation.' } });
+    }
+
+    const bad = (message) => {
+        console.warn(`[gemini] ${req.userId} ${operation} — refused: ${message}`);
+        return res.status(400).json({ error: { message } });
+    };
+
+    const { contents } = req.body || {};
+    if (!Array.isArray(contents) || contents.length === 0) {
+        /* The same wording the handler used before this middleware existed, so
+           a client already handling that string sees no change. */
+        return bad('Request must include a non-empty "contents" array.');
+    }
+    if (contents.length > MAX_CONTENTS_ENTRIES) {
+        return bad(`"contents" must contain at most ${MAX_CONTENTS_ENTRIES} entries.`);
+    }
+
+    let textChars = 0;
+    let imageParts = 0;
+    let totalParts = 0;
+
+    for (const entry of contents) {
+        /* ⚠️ THE ENTRY'S OWN KEYS ARE NOT POLICED, only its parts. `role` is
+           legal Gemini and no sender uses it today; refusing unknown keys here
+           would break the first one to add it and buy nothing, because an
+           entry carries no payload of its own. Cost lives in the parts. */
+        if (!entry || typeof entry !== 'object' || !Array.isArray(entry.parts)) {
+            return bad('Each "contents" entry must have a "parts" array.');
+        }
+        for (const part of entry.parts) {
+            if (!part || typeof part !== 'object') return bad('Each part must be an object.');
+
+            totalParts += 1;
+            if (totalParts > MAX_PARTS_TOTAL) {
+                return bad(`A request may contain at most ${MAX_PARTS_TOTAL} parts.`);
+            }
+
+            const hasText = Object.prototype.hasOwnProperty.call(part, 'text');
+            const hasInline = Object.prototype.hasOwnProperty.call(part, 'inlineData');
+
+            /* ⚠️ EXACTLY ONE RECOGNISED KIND, AND NOTHING ELSE — a whitelist,
+               because it is the only form of this check that stays correct
+               when Gemini adds the next part type. `fileData` is the one it
+               refuses by name in spirit: a `fileUri` is how a caller makes
+               Gemini fetch and bill a file this proxy never saw and cannot
+               size. `functionCall`, `functionResponse` and `executableCode`
+               are the same problem in other clothes. */
+            if (Object.keys(part).length !== 1 || (!hasText && !hasInline)) {
+                return bad('Each part must contain exactly one of "text" or "inlineData".');
+            }
+
+            if (hasText) {
+                if (typeof part.text !== 'string') return bad('"text" must be a string.');
+                textChars += part.text.length;
+                if (textChars > MAX_PROMPT_CHARS) {
+                    return bad(`The prompt must be at most ${MAX_PROMPT_CHARS} characters.`);
+                }
+                continue;
+            }
+
+            const inline = part.inlineData;
+            if (!inline || typeof inline !== 'object') return bad('"inlineData" must be an object.');
+            if (!ALLOWED_INLINE_MIME.has(inline.mimeType)) {
+                return bad('"inlineData.mimeType" must be image/jpeg or image/png.');
+            }
+            if (typeof inline.data !== 'string') return bad('"inlineData.data" must be a base64 string.');
+            if (inline.data.length > MAX_IMAGE_B64_CHARS) {
+                return bad(`Each image must be at most ${MAX_IMAGE_B64_CHARS} base64 characters.`);
+            }
+
+            imageParts += 1;
+            if (imageParts > MAX_IMAGE_PARTS) {
+                /* ⚠️ COUNT, NOT BYTES, IS THE COST BOUND HERE. Gemini bills an
+                   image by tile count derived from its dimensions, so a small
+                   file is not a cheap image and the byte cap above is a
+                   memory sanity bound, not a price one. Four is what every
+                   sender sends at most — the front/back/left/right slots. */
+                return bad(`A request may contain at most ${MAX_IMAGE_PARTS} images.`);
+            }
+        }
+    }
+
+    return next();
+};
+
 
 /**
  * @param costOf optional `(req) => number`. Omitted, every request costs 1,
@@ -2617,15 +2840,21 @@ app.get('/health', wrap(async (req, res) => {
    already, which is what carries its 413 and its malformed-JSON 400 to the
    error handler. Wrapping it would add a layer that never fires.
 
-   ⚠️ IT SITS AFTER BOTH GUARDS. `rateLimitAi` needs `req.body` — operation,
-   initiated, workoutId — so the parser has to precede it; nothing above it
-   does, since H1. */
-app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '25mb' }), wrap(rateLimitAi), wrap(async (req, res) => {
+   ⚠️ IT SITS AFTER BOTH GUARDS AND BEFORE BOTH CHECKS. `validateAiRequest`
+   and `rateLimitAi` both need `req.body` — operation, contents, initiated,
+   workoutId — so the parser has to precede them; nothing above it does, since
+   H1. The order of the two after it is H3's: shape first, then ration. */
+app.post('/api/ai/generate', wrap(requireUser), wrap(requireSubscription), express.json({ limit: GENERATE_BODY_LIMIT_BYTES }), validateAiRequest, wrap(rateLimitAi), wrap(async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured on the proxy server.' } });
     }
 
+    /* ⚠️ `contents` IS RE-CHECKED BELOW AND THAT IS NOT DEAD CODE BY ACCIDENT.
+       `validateAiRequest` has already refused every shape this route rejects,
+       so the check cannot fire through the router — it stays because it is the
+       handler's own precondition and the next caller may not come through the
+       same middleware chain. */
     const { contents, generationConfig, model } = req.body || {};
     /* Only for the usage line — see logUsage on why this is a hint, not a fact. */
     const operationLabel = typeof req.body?.operation === 'string' ? req.body.operation : null;
