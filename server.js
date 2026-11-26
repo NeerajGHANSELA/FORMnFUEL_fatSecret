@@ -2582,7 +2582,17 @@ app.use(['/api/nutrition/analyze', '/api/nutrition/estimate'], (req, res, next) 
 /* 100kb, not 25mb: these carry ingredient NAME lists. A generation's ~115
    match rows arrive across about 25 requests, so a handful of short strings
    each — two orders of magnitude of headroom, and no reason for this route to
-   be able to buffer what the photo route can. */
+   be able to buffer what the photo route can.
+
+   ⚠️ IT BOUNDS BYTES AND NOT MUCH ELSE. Do not read a tight body limit as a
+   bound on the WORK. 100 KiB of legal JSON holds about 34,000 empty strings,
+   12,800 five-character ones or 1,600 sixty-character ones — measured, and a
+   13,162-element body was accepted here and answered 200. Each unresolved
+   ingredient costs up to three FatSecret searches plus a Gemini call plus a
+   food.get, and `rateLimitFixed` counts REQUESTS, not ingredients. So this
+   limiter is sized for a meal and this parser permits a dictionary, which is
+   H3 and is NOT fixed by this number. The cap that matters is on the array
+   length, in the handler, and it is still missing. */
 app.post('/api/nutrition/analyze', wrap(requireUser), wrap(requireSubscription), express.json({ limit: '100kb' }), rateLimitFixed('nutrition'), wrap(async (req, res) => {
     const { ingredients, foodCores } = req.body;
 
